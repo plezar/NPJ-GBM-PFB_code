@@ -1,0 +1,177 @@
+---
+title: "TCGA brain"
+author: "Maksym"
+date: "7/8/2022"
+output: html_document
+---
+
+Loading packages
+```{r}
+library("TCGAbiolinks")
+library("SummarizedExperiment")
+library(tidyverse)
+library(edgeR)
+#library(DESeq2)
+```
+
+
+## Preparing data
+
+### GBM
+
+```{r}
+TCGAbiolinks:::getProjectSummary("TCGA-GBM")
+```
+
+```{r}
+query_TCGA = GDCquery(
+  project = "TCGA-GBM",
+  data.category = "Transcriptome Profiling",
+  experimental.strategy = "RNA-Seq",
+  workflow.type = "STAR - Counts")
+```
+
+```{r}
+lihc_res = getResults(query_TCGA)
+```
+
+```{r}
+query_TCGA = GDCquery(
+  project = "TCGA-GBM",
+  data.category = "Transcriptome Profiling", # parameter enforced by GDCquery
+  experimental.strategy = "RNA-Seq",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts")
+```
+
+```{r}
+getManifest(query_TCGA)
+#setwd("data")
+GDCdownload(query = query_TCGA)
+```
+
+Loading the data
+```{r}
+#setwd("data/")
+tcga_data = GDCprepare(query_TCGA)
+```
+
+```{r}
+library(clusterProfiler)
+library("org.Hs.eg.db")
+
+x = rownames(assays(tcga_data)[[1]])
+x = str_split(x, "\\.", Inf, T)[,1]
+
+ids = bitr(x, 
+            fromType = "ENSEMBL", 
+            toType = c("SYMBOL"), 
+            OrgDb = "org.Hs.eg.db")
+
+
+d = as.data.frame(assays(tcga_data)[[1]]) %>% rownames_to_column("ENSEMBL")
+d$ENSEMBL = x
+
+d = ids %>% left_join(d, "ENSEMBL") %>% dplyr::select(-ENSEMBL)
+d = d[!d$SYMBOL %in% d$SYMBOL[duplicated(d$SYMBOL)],]
+rownames(d) = d$SYMBOL
+d$SYMBOL = NULL
+d = as.matrix(d)
+```
+
+
+Normalization
+```{r}
+dge = DGEList(counts=d,
+             samples=colData(tcga_data))
+
+keep = filterByExpr(dge)
+dge = dge[keep,,keep.lib.sizes=FALSE]
+dge = calcNormFactors(dge, method = "TMM")
+dge$cpm = cpm(dge)
+```
+
+```{r, eval=F}
+saveRDS(dge, "data/TCGA_GBM_DGEList.rds")
+```
+
+
+
+### LGG
+
+```{r}
+TCGAbiolinks:::getProjectSummary("TCGA-LGG")
+```
+
+```{r}
+query_TCGA = GDCquery(
+  project = "TCGA-LGG",
+  data.category = "Transcriptome Profiling", # parameter enforced by GDCquery
+  experimental.strategy = "RNA-Seq",
+  workflow.type = "STAR - Counts")
+```
+
+```{r}
+lihc_res = getResults(query_TCGA)
+```
+
+```{r}
+query_TCGA = GDCquery(
+  project = "TCGA-LGG",
+  data.category = "Transcriptome Profiling", # parameter enforced by GDCquery
+  experimental.strategy = "RNA-Seq",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts")
+```
+
+```{r}
+getManifest(query_TCGA)
+setwd("data/")
+GDCdownload(query = query_TCGA)
+```
+
+
+Loading the data
+```{r}
+setwd("data/")
+tcga_data = GDCprepare(query_TCGA)
+```
+
+```{r}
+x = rownames(assays(tcga_data)[[1]])
+x = str_split(x, "\\.", Inf, T)[,1]
+
+ids = bitr(x, 
+            fromType = "ENSEMBL", 
+            toType = c("SYMBOL"), 
+            OrgDb = "org.Hs.eg.db")
+
+
+d = as.data.frame(assays(tcga_data)[[1]]) %>% rownames_to_column("ENSEMBL")
+d$ENSEMBL = x
+
+d = ids %>% left_join(d, "ENSEMBL") %>% dplyr::select(-ENSEMBL)
+d = d[!d$SYMBOL %in% d$SYMBOL[duplicated(d$SYMBOL)],]
+rownames(d) = d$SYMBOL
+d$SYMBOL = NULL
+d = as.matrix(d)
+```
+
+
+Normalization
+```{r}
+dge = DGEList(counts=d,
+             samples=colData(tcga_data))
+
+keep = filterByExpr(dge)
+dge = dge[keep,,keep.lib.sizes=FALSE]
+dge = calcNormFactors(dge, method = "TMM")
+dge$cpm = cpm(dge)
+```
+
+```{r, eval=F}
+saveRDS(dge, "data/TCGA_LGG_DGEList.rds")
+```
+
+
+

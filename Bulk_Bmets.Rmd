@@ -1,0 +1,146 @@
+---
+title: "Bulk BMets"
+output: html_document
+date: "2023-03-19"
+---
+
+```{r}
+library(GEOquery)
+library(stringr)
+library(edgeR)
+```
+### Preprocessing
+
+```{r}
+geo_obj <- getGEO('GSE164150')
+metadata = pData(phenoData(geo_obj$GSE164150_series_matrix.txt.gz))
+```
+
+```{r}
+pwd = "/Volumes/TOSHIBA/TIMElab/GSE164150_RAW/"
+setwd(pwd)
+
+files = list.files(pwd)
+sample_names = str_split(files, "_", Inf, T)[,1]
+
+exp_data = matrix(nrow = 60488, ncol = 0)
+for (i in files) {
+  cur_file = read.delim(i, header=F, comment.char="#")
+  exp_data = cbind(exp_data, cur_file$V2)
+}
+
+colnames(exp_data) = sample_names
+rownames(exp_data) = cur_file$V1
+```
+
+```{r}
+library('biomaRt')
+
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+genes <- rownames(exp_data)
+genes = str_split(genes, "\\.", Inf, T)[,1]
+rownames(exp_data) = genes
+G_list <- getBM(filters= "ensembl_gene_id", attributes= c("ensembl_gene_id", "hgnc_symbol"),values=genes,mart= mart)
+G_list
+```
+
+```{r}
+dups = unique(G_list$hgnc_symbol[duplicated(G_list$hgnc_symbol)])
+G_list = G_list[!G_list$hgnc_symbol%in%dups,]
+```
+
+```{r}
+exp_data = exp_data[G_list$ensembl_gene_id,]
+rownames(exp_data) = G_list$hgnc_symbol
+```
+
+
+```{r}
+metadata = metadata[,c("title", "geo_accession", "characteristics_ch1.3", "characteristics_ch1.4")]
+colnames(metadata) = c("sample_name", "geo_accession", "surv_time", "deceased")
+metadata$surv_time = as.numeric(str_split(metadata$surv_time, ": ", Inf, T)[,2])
+metadata$deceased = as.numeric(str_split(metadata$deceased, ": ", Inf, T)[,2])
+metadata$deceased = ifelse(metadata$deceased==1, 0, 1)
+
+metadata = metadata[colnames(exp_data),]
+```
+
+
+Normalization
+```{r}
+dge = DGEList(counts=exp_data,
+             samples=metadata)
+
+keep = filterByExpr(dge)
+dge = dge[keep,,keep.lib.sizes=FALSE]
+dge = calcNormFactors(dge, method = "TMM")
+dge$logcpm = cpm(dge, log=T)
+```
+
+
+```{r}
+plotMDS.DGEList(dge)
+```
+
+
+```{r, eval=F}
+saveRDS(dge, paste0(pwd, "BMets_DGEList.rds"))
+```
+
+
+### Subtype calling
+
+```{r}
+pwd = "/Volumes/TOSHIBA/TIMElab/GSE164150_RAW/"
+dge = readRDS(paste0(pwd, "BMets_DGEList.rds"))
+```
+
+
+```{r}
+sigs = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+```
+
+```{r}
+library(scrabble)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+
+sigs$ECMhi = sigs$ECMhi[sigs$ECMhi%in%rownames(dge)]
+sigs$ECMlo = sigs$ECMlo[sigs$ECMlo%in%rownames(dge)]
+
+sig_scores = scrabble::score(
+  mat = dge$logcpm,
+  groups = sigs
+)
+
+sig_scores_df = sig_scores %>%
+  as.data.frame() %>%
+  mutate(ECM.cluster = if_else(ECMhi > 0 & ECMlo < -(0), "ECMhi",
+                               if_else(ECMhi < (-0) & ECMlo > 0, "ECMlo", "mixed")))
+
+dge$samples = cbind(dge$samples, sig_scores_df)
+```
+
+```{r}
+saveRDS(dge, paste0(pwd, "BMets_DGEList.rds"))
+```
+
+
+```{r}
+Heatmap(t(dge$samples[,c("ECMhi", "ECMlo")]),
+        column_split = factor(dge$samples$ECM.cluster))
+```
+
+
+
+```{r}
+subtype_freq = dge$samples  %>%
+  mutate(Histology = "Bmets") %>%
+  group_by(Histology, ECM.cluster) %>%
+  summarise(Count = n()) %>%
+  mutate(Pct = Count/sum(Count), Total_samples = sum(Count))
+
+write.table(subtype_freq, "/Volumes/TOSHIBA/TIMElab/GSE164150_RAW/Bmets_ECM_subtype_freq.tsv", sep="\t")
+```
+

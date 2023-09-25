@@ -1,0 +1,100 @@
+---
+title: "Brain_atlas"
+author: "Maksym"
+date: "3/8/2023"
+output: ''
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+```
+
+
+## Reading data
+
+```{r}
+data_dir = "/Volumes/TOSHIBA/TIMElab/GSE163577_RAW/"
+doublet_dir = "/Volumes/TOSHIBA/TIMElab/GSE163577_processed/scrublet/"
+sample_ids = list.files(data_dir)
+```
+
+
+```{r, echo=F}
+add_meta_seurat <- function(obj) {
+  obj$mitoRatio <- PercentageFeatureSet(object = obj, pattern = "^MT-")
+  obj$mitoRatio <- obj@meta.data$mitoRatio / 100
+  obj@meta.data <- obj@meta.data %>%
+    dplyr::rename(seq_folder = orig.ident,
+                  nUMI = nCount_RNA,
+                  nGene = nFeature_RNA)
+  return(obj)
+}
+```
+
+Reading 10x data
+```{r}
+read_10X_into_list <- function(file) {
+  doublets <- readLines(paste0(doublet_dir, "GSE163577_processed", file, ".txt"))
+  seurat_data <- Read10X(data.dir = paste(data_dir, file, sep="/"))
+  seurat_obj <- CreateSeuratObject(counts = seurat_data)
+  seurat_obj$scrublet.doublet <- doublets
+  seurat_obj <- add_meta_seurat(seurat_obj)
+  return(seurat_obj)
+}
+
+obj_list = lapply(sample_ids, read_10X_into_list)
+obj_list = lapply(obj_list, function(x) {return(x[,x$scrublet.doublet==0])})
+obj_list = lapply(obj_list, function(x) {return(x[,x$nUMI>200])})
+obj_list = lapply(obj_list, function(x) {return(x[,!(x$nGene<200 & x$mitoRatio>0.05)])})
+obj_list = lapply(obj_list, function(x) {return(x[,!(x$nGene>5000)])})
+```
+
+```{r}
+for (i in 1:length(obj_list)) {
+  obj_list[[i]]$sample <- sample_ids[i]
+}
+```
+
+
+rPCA integration
+```{r}
+integrate_seurat <- function(obj_list) {
+  
+  options(future.globals.maxSize = 4000 * 1024^2)
+  
+  obj_list <- lapply(X = obj_list, FUN = function(x) {
+    x <- NormalizeData(x)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+  })
+  
+  
+  integ_features <- SelectIntegrationFeatures(object.list = obj_list) 
+ 
+  obj_list <- lapply(X = obj_list, FUN = function(x) {
+    x <- ScaleData(x, features = integ_features, verbose = FALSE)
+    x <- RunPCA(x, features = integ_features, verbose = FALSE)
+  })
+  
+  # Find best buddies - can take a while to run
+  integ_anchors <- FindIntegrationAnchors(object.list = obj_list, 
+                                          anchor.features = integ_features,
+                                          reduction = "rpca")
+  
+  # Integrate across conditions
+  obj <- IntegrateData(anchorset = integ_anchors, k.weight = 50)
+  return(obj)
+}
+```
+
+```{r}
+integrated_seurat <- integrate_seurat(obj_list)
+```
+
+```{r}
+saveRDS(integrated_seurat, "F:/TIMElab/GSE163577_processed/integrated_seurat.rds")
+```
+
+
+
+

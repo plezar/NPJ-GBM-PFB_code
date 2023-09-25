@@ -1,0 +1,162 @@
+---
+title: "Brain atlas integration"
+output: html_document
+date: "2023-08-03"
+---
+
+## Loading packages
+
+```{r}
+library(Seurat)
+library(SeuratData)
+library(SeuratWrappers)
+library(tidyverse)
+library(cowplot)
+```
+
+```{r}
+seurat_obj_atlas = readRDS("/Volumes/TOSHIBA/TIMElab/GSE163577_processed/integrated_seurat_stromal_subset.rds")
+seurat_obj_gbm = readRDS("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/muralcells.rds")
+
+unique(seurat_obj_gbm$cell.type.fine)
+```
+
+
+```{r}
+seurat_obj_atlas@meta.data = seurat_obj_atlas@meta.data %>%
+  rownames_to_column() %>%
+  left_join(
+    data.frame(cell.type = c("Pericyte", "SMC", "Perivascular Fibroblast", "Meningeal Fibroblast"),
+               cell.type.fine = c("PC", "SMC", "P-FB", "M-FB"))
+  ) %>% column_to_rownames("rowname")
+```
+
+```{r}
+overlapping_genes = Reduce(intersect, list(
+  rownames(seurat_obj_atlas),
+  rownames(seurat_obj_gbm)
+))
+```
+
+```{r}
+count_data = cbind(
+  seurat_obj_atlas@assays$RNA@counts[overlapping_genes,],
+  seurat_obj_gbm@assays$RNA@counts[overlapping_genes,]
+  )
+```
+
+```{r}
+metadata = rbind(
+  seurat_obj_atlas@meta.data %>% select(cell.type.fine) %>% mutate(Dataset = "Atlas"),
+  seurat_obj_gbm@meta.data %>% select(cell.type.fine) %>% mutate(Dataset = "GBM")
+)
+```
+
+```{r}
+seurat_obj = CreateSeuratObject(
+  counts = count_data,
+  meta.data = metadata
+)
+```
+
+
+```{r}
+seurat_obj <- NormalizeData(seurat_obj)
+```
+
+```{r}
+#rm(lgpt, meningioma, nf, mets, gbm)
+```
+
+```{r}
+seurat_obj <- FindVariableFeatures(seurat_obj)
+
+seurat_obj_integrated <- RunFastMNN(object.list = SplitObject(seurat_obj, split.by = "Dataset"))
+seurat_obj_integrated <- RunUMAP(seurat_obj_integrated, reduction = "mnn", dims = 1:15)
+seurat_obj_integrated <- FindNeighbors(seurat_obj_integrated, reduction = "mnn", dims = 1:15)
+seurat_obj_integrated <- FindClusters(seurat_obj_integrated)
+```
+
+```{r}
+p1 = DimPlot(seurat_obj_integrated, group.by = c("Dataset"), label = T)
+p2 = DimPlot(seurat_obj_integrated, group.by = c("cell.type.fine"), label = T)
+p1 + p2
+```
+
+
+
+## Seurat integration
+
+```{r}
+options(future.globals.maxSize = 4000 * 1024^2)
+obj_list = SplitObject(seurat_obj, split.by = "Dataset")
+
+obj_list <- lapply(X = obj_list, FUN = function(x) {
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+})
+
+
+integ_features <- SelectIntegrationFeatures(object.list = obj_list) 
+
+obj_list <- lapply(X = obj_list, FUN = function(x) {
+  x <- ScaleData(x, features = integ_features, verbose = FALSE)
+  x <- RunPCA(x, features = integ_features, verbose = FALSE)
+})
+
+# Find best buddies - can take a while to run
+integ_anchors <- FindIntegrationAnchors(object.list = obj_list, 
+                                        anchor.features = integ_features,
+                                        reduction = "rpca")
+
+# Integrate across conditions
+seurat_obj <- IntegrateData(anchorset = integ_anchors, k.weight = 50)
+```
+
+Reading the integrated object ...
+```{r}
+# Run the standard workflow for visualization and clustering
+seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
+seurat_obj <- RunPCA(seurat_obj, npcs = 30, verbose = FALSE)
+seurat_obj <- RunUMAP(seurat_obj, reduction = "pca", dims = 1:12)
+seurat_obj <- FindNeighbors(seurat_obj, reduction = "pca", dims = 1:12)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.1)
+Idents(seurat_obj) <- "integrated_snn_res.0.1"
+```
+
+```{r}
+seurat_obj$cell.type.fine = factor(seurat_obj$cell.type.fine, levels = c("P-FB", "PC", "SMC", "M-FB"))
+
+p1 = DimPlot(seurat_obj, group.by = c("Dataset"), label = T, cols = c("#D3D3D3","#E64B35FF"), label.size = 8) + theme_void() + NoLegend()
+
+p2 = DimPlot(seurat_obj, group.by = c("cell.type.fine"), label = T, label.size = 8, repel = T) + theme_void() + NoLegend()
+p1 + p2
+```
+
+```{r}
+ggsave(p1, path="/Volumes/TOSHIBA/TIMElab/figures/FIG2/", filename= "Atlas_GBM_mural_integration_by_dataset.pdf", width=3.2, height=3, dpi = 700)
+
+ggsave(p2, path="/Volumes/TOSHIBA/TIMElab/figures/FIG2/", filename= "Atlas_GBM_mural_integration_by_celltype.pdf", width=3.2, height=3, dpi = 700)
+```
+
+
+
+```{r}
+p = ggplot(seurat_obj@meta.data,
+       aes(fill=cell.type.fine, x=integrated_snn_res.0.1)) + geom_bar(position="fill") + theme_cowplot() + labs(x = NULL, y = "Frequency", fill = NULL)
+
+p
+```
+
+
+
+```{r}
+DimPlot(seurat_obj, label = T)
+```
+
+### Saving data
+
+```{r}
+saveRDS(seurat_obj, "/Volumes/TOSHIBA/TIMElab/GSE163577_processed/Atlas_GBM_mural_integration_seurat_obj.rds")
+```
+

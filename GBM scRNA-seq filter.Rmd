@@ -1,0 +1,377 @@
+---
+title: "GBM scRNA-seq preprocess new"
+output: html_document
+date: "2023-01-04"
+---
+
+Packages
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(stringr)
+  library(purrr)
+  library(scran)
+  library(tidyverse)
+  library(DoubletFinder)
+  library(RColorBrewer)
+})
+fig_path = "H:/TIMElab/figures/"
+source("util.R")
+```
+
+```{r}
+seurat_obj <- readRDS("H:/TIMElab/GSE182109_processed/integrated_seurat_object.rds")
+```
+
+```{r}
+doublets <- read_tsv("H:/TIMElab/GSE182109_processed/scrublet/all_doublets.tsv")
+```
+
+```{r}
+seurat_obj$scrublet.doublet = seurat_obj@meta.data %>% rownames_to_column("cell") %>% left_join(doublets, "cell") %>% pull(scrublet.doublet)
+```
+
+Removing doublets
+```{r}
+seurat_obj = seurat_obj[,seurat_obj$scrublet.doublet==0]
+```
+
+
+```{r}
+seurat_obj$lognUMI <- log2(seurat_obj$nUMI)
+VlnPlot(seurat_obj, pt.size = 0, "lognUMI") / VlnPlot(seurat_obj,  pt.size = 0,  "mitoRatio")
+```
+
+```{r}
+DefaultAssay(seurat_obj) = "RNA"
+seurat_obj = NormalizeData(seurat_obj)
+seurat_obj = ScaleData(seurat_obj)
+```
+
+
+```{r}
+p = DotPlot(seurat_obj,
+        features = c("PDGFRA", "SOX2", "OLIG1", "NES", "GFAP", "S100B", "EGFR", "MBP", "PDGFRB", "ACTA2", "PROM1", "PECAM1", "TEK", "P2RY12", "PTPRC", "ITGAM", "ITGAX", "S100A8", "CD68", "MRC1", "NKG7", "CD3E", "CD8A", "CD4", "CD79A", "MKI67"), cluster.idents = T) +
+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+p
+```
+
+Removing clusters 4, 5, 23 due to low nUMI, high %MT and uninformative marker genes
+```{r}
+seurat_obj = subset(seurat_obj, idents = c(4, 5, 23), invert=T)
+```
+
+
+```{r}
+Idents(seurat_obj) <- "integrated_snn_res.0.6"
+seurat_obj <- RenameIdents(object = seurat_obj, 
+                              "0" = "Myeloid",
+                              "1" = "Glioma",
+                              "2" = "Myeloid",
+                              "3" = "Glioma",
+                              "6" = "Glioma",
+                              "7" = "Glioma",
+                              "8" = "Glioma",
+                              "9" = "Myeloid",
+                              "10" = "T cell",
+                           "11" = "T cell",
+                           "12" = "Glioma",
+                           "13" = "Glioma",
+                           "14" = "Glioma",
+                           "15" = "Oligo",
+                           "16" = "Glioma",
+                           "17" = "Myeloid",
+                           "18" = "Myeloid",
+                           "19" = "Myeloid",
+                           "20" = "Mural cell",
+                           "21" = "Glioma",
+                           "22" = "T cell",
+                           "24" = "Endothelial",
+                           "25" = "Myeloid",
+                           "26" = "B cell",
+                           "27" = "Glioma",
+                           "28" = "Myeloid",
+                           "29" = "T cell",
+                           "30" = "Glioma",
+                           "31" = "Myeloid",
+                           "32" = "T cell")
+seurat_obj$cell.type = Idents(seurat_obj)
+```
+
+```{r}
+DimPlot(seurat_obj, label=T)
+DimPlot(seurat_obj, label=T, group.by = "integrated_snn_res.0.6")
+```
+
+sclean
+```{r}
+VlnPlot(seurat_obj, pt.size = 0, "lognUMI") / VlnPlot(seurat_obj,  pt.size = 0,  "mitoRatio")
+```
+
+```{r}
+score_cells <- function(meta) {
+  # Scores each cell based on "default filtering" described in PipeComp paper
+  v.1 <- isOutlier(meta$mitoRatio, nmads = 2.5, type = "higher", batch = meta$sclean_group.var)
+  v.2 <- meta$mitoRatio > 0.08
+  
+  sc.1 <- as.integer(v.1 | v.2)
+  
+  v.1 <- isOutlier(log10(meta$nUMI), nmads = 2.5, type = "higher", batch = meta$sclean_group.var)
+  v.2 <- isOutlier(log10(meta$nUMI),  nmads = 5, type = "lower", batch = meta$sclean_group.var)
+  
+  sc.2 <- as.integer(v.1 | v.2)
+  
+  v.1 <- isOutlier(log10(meta$nGene), nmads = 2.5, type = "higher", batch = meta$sclean_group.var)
+  v.2 <- isOutlier(log10(meta$nGene), nmads = 5, type = "lower", batch = meta$sclean_group.var)
+  
+  sc.3 <- as.integer(v.1 | v.2)
+  
+  v.1 <- isOutlier(meta$pct_counts_in_top_20_features, nmads = 5, type = "higher", batch = meta$sclean_group.var)
+  v.2 <- isOutlier(meta$pct_counts_in_top_20_features, nmads = 5, type = "lower", batch = meta$sclean_group.var)
+  
+  sc.4 <- as.integer(v.1 | v.2)
+  
+  v.1 <- isOutlier(meta$log10GenesPerUMI, nmads = 2.5, type = "higher", batch = meta$sclean_group.var)
+  v.2 <- isOutlier(meta$log10GenesPerUMI, nmads = 5, type = "lower", batch = meta$sclean_group.var)
+  
+  sc.5 <- as.integer(v.1 | v.2)
+  
+  filt.score <- rowSums(cbind(sc.1, sc.2, sc.3, sc.4, sc.5))
+  
+  return(filt.score)
+}
+```
+
+```{r}
+cell_stats_before = seurat_obj@meta.data %>%
+  group_by(cell.type) %>%
+  summarise(Raw = n())
+```
+
+
+```{r}
+# Main assumption is that most of the cells are living: removing cells that are definitely dead
+seurat_obj$sclean_group.var = paste(seurat_obj$seq_folder, seurat_obj$cell.type, sep="_")
+seurat_obj <- subset(x = seurat_obj, subset = mitoRatio < 0.2)
+seurat_obj$filt.score <- score_cells(seurat_obj@meta.data)
+seurat_obj$qc_default <- if_else(seurat_obj$filt.score<=1, 1, 0)
+seurat_obj$qc_stringent <- if_else(seurat_obj$filt.score<1, 1, 0)
+```
+
+```{r}
+cell_stats_default = seurat_obj@meta.data %>%
+  group_by(cell.type, qc_default) %>%
+  summarise(Default = n()) %>%
+  filter(qc_default == 1) %>%
+  select(-qc_default)
+
+cell_stats_stringent = seurat_obj@meta.data %>%
+  group_by(cell.type, qc_stringent) %>%
+  summarise(Stringent = n()) %>%
+  filter(qc_stringent == 1) %>%
+  select(-qc_stringent)
+
+cell_stats = full_join(cell_stats_before, cell_stats_default) %>%
+  full_join(cell_stats_stringent)
+
+cell_stats = cell_stats %>%
+  mutate(Default = Raw-Default,
+         Stringent = Raw-Stringent) %>%
+  mutate(Default.frac = Default/Raw,
+         Stringent.frac = Stringent/Raw)
+```
+
+```{r}
+write_tsv(cell_stats, "H:/TIMElab/GSE182109_processed/cell_filtering_stats.tsv")
+```
+
+```{r}
+DimPlot(seurat_obj, split.by  = "qc_stringent")
+DimPlot(seurat_obj, split.by  = "qc_default")
+```
+
+
+
+
+```{r}
+saveRDS(seurat_obj, "H:/TIMElab/GSE182109_processed/integrated_filtered_seurat_object.rds")
+```
+
+
+Filtering using the default filter
+```{r}
+seurat_obj = seurat_obj[,seurat_obj$qc_default==1]
+```
+
+
+Adding some metadata
+```{r}
+sample_meta = read_tsv("H:/TIMElab/GSE182109_processed/sample_mapping.txt")
+
+seurat_obj@meta.data = seurat_obj@meta.data %>%
+  rownames_to_column("cell") %>%
+  left_join(sample_meta, "seq_folder") %>%
+  column_to_rownames("cell")
+
+seurat_obj$diagnosis = str_split(seurat_obj$patient, "-", Inf, T)[,1]
+```
+
+
+Removing LGG samples
+```{r}
+seurat_obj = seurat_obj[,seurat_obj$diagnosis!="LGG"]
+```
+
+
+Removing samples with fewer than 1000 cells
+```{r}
+samples_to_leave = seurat_obj@meta.data %>%
+  group_by(seq_folder) %>%
+  summarise(Count = n()) %>%
+  ungroup() %>%
+  filter(Count > 1000) %>%
+  pull(seq_folder)
+```
+
+```{r}
+seurat_obj = seurat_obj[,seurat_obj$seq_folder %in% samples_to_leave]
+```
+
+
+
+
+### Pseudobulk samples
+
+```{r, eval=F}
+library(scuttle)
+library(edgeR)
+
+DefaultAssay(seurat_obj) <- "RNA"
+
+merged_sce <- as.SingleCellExperiment(DietSeurat(seurat_obj))
+merged_sce@assays@data$logcounts <- NULL
+summed <- aggregateAcrossCells(merged_sce, 
+                               id=colData(merged_sce)[,c("seq_folder")],
+                               use.assay.type = 1)
+
+
+y <- DGEList(counts(summed), samples=colData(summed))
+keep <- filterByExpr(y)
+y <- y[keep,]
+y <- calcNormFactors(y)
+y$log2cpm = cpm(y, log=TRUE)
+
+saveRDS(y, "H:/TIMElab/GSE182109_processed/scrnaseq_psedobulk.rds")
+```
+
+
+Scoring samples
+
+```{r}
+sigs = readRDS("H:/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+```
+
+```{r}
+library(scrabble)
+library(ComplexHeatmap)
+
+sigs$ECMhi = sigs$ECMhi[sigs$ECMhi%in%rownames(y)]
+sigs$ECMlo = sigs$ECMlo[sigs$ECMlo%in%rownames(y)]
+
+sig_scores = scrabble::score(
+  mat = y$log2cpm,
+  groups = sigs
+)
+
+Heatmap(t(sig_scores))
+```
+
+```{r}
+library(circlize)
+
+score_threshold = 0
+
+y$samples$ECM.cluster = sig_scores %>%
+  as.data.frame() %>%
+  mutate(ECM.cluster = if_else(ECMhi > score_threshold & ECMlo < -(score_threshold), "ECMhi", if_else(ECMhi < (-score_threshold) & ECMlo > score_threshold, "ECMlo", "undefined"))) %>%
+  #mutate(ECM.cluster = if_else(ECMhi > score_threshold, "ECMhi", if_else(ECMlo > score_threshold, "ECMlo", "undefined"))) %>%
+  pull(ECM.cluster)
+
+ht = Heatmap(t(sig_scores),
+        name = "Signature score",
+        column_split = factor(y$samples$ECM.cluster),
+        col = colorRamp2(seq(-3, 3, length.out=11), rev(brewer.pal(n=11, name="RdBu"))),
+        show_column_dend = F,
+        show_row_dend = F)
+
+ht
+```
+
+```{r}
+pdf(paste0(fig_path, "pseudobulk_ECM_subtypes_heatmap.pdf"), width = 8, height = 3)
+draw(ht)
+dev.off()
+```
+
+
+PCA
+```{r}
+source("util.R")
+p = plot_PCA(y$log2cpm,
+         y$samples,
+         "ECM.cluster")
+p
+```
+
+```{r}
+ggsave(p, path=fig_path, filename= "pseudobulk_ECM_subtypes_pca.pdf", width=5.2, height=4, dpi=700)
+```
+
+
+```{r}
+seurat_obj$ECM.cluster = NULL
+seurat_obj$ECM.cluster = seurat_obj@meta.data %>%
+  left_join(
+    y$samples %>%
+      select(seq_folder, ECM.cluster), "seq_folder"
+  ) %>%
+  pull(ECM.cluster)
+
+DimPlot(seurat_obj, split.by  = "ECM.cluster")
+```
+
+
+```{r}
+DefaultAssay(seurat_obj) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
+seurat_obj <- RunPCA(seurat_obj, npcs = 30, verbose = FALSE)
+ElbowPlot(seurat_obj)
+```
+
+```{r}
+seurat_obj <- RunUMAP(seurat_obj, reduction = "pca", dims = 1:7)
+seurat_obj <- FindNeighbors(seurat_obj, reduction = "pca", dims = 1:7)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.3)
+```
+```{r}
+DimPlot(seurat_obj, group.by = "cell.type") + DimPlot(seurat_obj, label=T)
+```
+
+```{r}
+DefaultAssay(seurat_obj) = "RNA"
+seurat_obj = NormalizeData(seurat_obj)
+seurat_obj = ScaleData(seurat_obj)
+
+p = DotPlot(seurat_obj,
+        features = c("PDGFRA", "SOX2", "OLIG1", "NES", "GFAP", "S100B", "EGFR", "MBP", "PDGFRB", "ACTA2", "PROM1", "PECAM1", "TEK", "P2RY12", "PTPRC", "ITGAM", "ITGAX", "S100A8", "CD68", "MRC1", "NKG7", "CD3E", "CD8A", "CD4", "CD79A", "MKI67"), cluster.idents = T, group.by = "cell.type") +
+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+p
+```
+
+```{r}
+saveRDS(seurat_obj, "H:/TIMElab/GSE182109_processed/integrated_filtered_seurat_object.rds")
+```
+
+

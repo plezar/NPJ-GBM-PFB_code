@@ -1,0 +1,856 @@
+---
+title: "Cell Chat compare"
+output: html_document
+date: "2022-11-07"
+---
+
+Loading the libraries
+```{r}
+library(CellChat)
+library(patchwork)
+library(Seurat)
+library(stringr)
+library(ComplexHeatmap)
+library(cowplot)
+options(stringsAsFactors = FALSE)
+source("../max/util.R")
+```
+
+```{r}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/"
+```
+
+
+## Reading the data
+
+```{r}
+seurat_obj = readRDS("H:/TIMElab/GSE182109_processed/cellchat/seurat_obj_list_4cellchat.rds")
+seurat_obj = seurat_obj[,seurat_obj$ECM.cluster!="undefined"]
+seurat_obj = SplitObject(seurat_obj, split.by = "ECM.cluster")
+```
+
+
+
+## Running cellchat
+
+```{r}
+run_CellChat = function(cellchat) {
+  cellchat <- subsetData(cellchat) # This step is necessary even if using the whole database
+  future::plan("multisession", workers = 12)
+  
+  cellchat <- identifyOverExpressedGenes(cellchat)
+  cellchat <- identifyOverExpressedInteractions(cellchat)
+  
+  cellchat <- computeCommunProb(cellchat)
+  cellchat <- filterCommunication(cellchat, min.cells = 10)
+  
+  cellchat <- computeCommunProbPathway(cellchat)
+  cellchat <- aggregateNet(cellchat)
+  
+  cellchat <- netAnalysis_computeCentrality(cellchat)
+  
+  return(cellchat)
+}
+```
+
+
+```{r}
+cellchat_list = lapply(seurat_obj, createCellChat, group.by = "cell.type.fine")
+```
+
+Going to use all CellChatDB for analysis
+```{r}
+CellChatDB <- CellChatDB.human
+CellChatDB.use <- CellChatDB
+for (i in 1:length(cellchat_list)) {
+  cellchat_list[[i]]@DB <- CellChatDB.use
+}
+```
+
+```{r}
+options(future.globals.maxSize= 850*1024^2)
+cellchat_list = lapply(cellchat_list, run_CellChat)
+```
+
+
+```{r}
+saveRDS(cellchat_list, "C:/Users/mzarodn2/Documents/cellchat_list.rds")
+```
+
+
+Merging datasets together
+```{r}
+object.list <- list(ECMhi = cellchat_list$ECMhi, ECMlo = cellchat_list$ECMlo)
+cellchat <- mergeCellChat(object.list, add.names = names(object.list))
+```
+
+```{r}
+saveRDS(cellchat, "C:/Users/mzarodn2/Documents/cellchat_obj.rds")
+saveRDS(object.list, "C:/Users/mzarodn2/Documents/cellchat_objlist.rds")
+```
+
+
+## Analysis
+
+```{r}
+cellchat = readRDS("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/cellchat/cellchat_obj.rds")
+object.list = readRDS("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/cellchat/cellchat_objlist.rds")
+```
+
+Making a table for cell types
+```{r}
+celltype_mapping = cellchat@meta %>%
+  distinct(cell.type, cell.type.fine)
+rownames(celltype_mapping) = celltype_mapping$cell.type.fine
+celltype_mapping = celltype_mapping[levels(cellchat@idents$joint),]
+celltype_mapping
+```
+
+```{r}
+gg1 <- compareInteractions(cellchat, show.legend = F, group = c(1,2), color.use = unname(palette_ECM_subtype)) + theme_cowplot(14)
+gg2 <- compareInteractions(cellchat, show.legend = F, group = c(1,2), measure = "weight", color.use = unname(palette_ECM_subtype)) + theme_cowplot(14)
+gg1 + gg2
+```
+
+```{r}
+ggsave(gg1+gg2, path="/Volumes/TOSHIBA/TIMElab/figures", filename= "n_interactions_strength.pdf", width=6, height=3, dpi=700)
+```
+
+
+
+Differential number of interactions
+```{r}
+gg1 <- netVisual_heatmap(cellchat, comparison = c(2, 1))
+#> Do heatmap based on a merged object
+gg2 <- netVisual_heatmap(cellchat, measure = "weight", comparison = c(2, 1))
+#> Do heatmap based on a merged object
+gg1 + gg2
+```
+
+```{r}
+pdf(paste0(fig_path, "cellchat_netVisual_heatmap.pdf"), width = 9.5, height = 5)
+draw(gg1 + gg2)
+dev.off()
+```
+
+
+
+
+
+
+
+
+
+## Relative changes in signaling
+
+```{r, eval=F}
+library(tidyverse)
+
+trace("netAnalysis_signalingChanges_scatter",edit=TRUE)
+
+cell_types_of_interest = levels(cellchat@idents$joint)
+
+signaling_changes = lapply(cell_types_of_interest, function(x) {
+  netAnalysis_signalingChanges_scatter(cellchat, idents.use = x, comparison = c(2, 1)) %>%
+    rownames_to_column("signaling")
+})
+names(signaling_changes) = cell_types_of_interest
+signaling_changes = bind_rows(signaling_changes, .id="cell.type")
+write_tsv(signaling_changes, "/Volumes/TOSHIBA/TIMElab/GSE182109_processed/cellchat/signaling_changes_table.tsv")
+```
+
+
+
+```{r}
+library(readr)
+signaling_changes = read_tsv("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/cellchat/signaling_changes_table.tsv")
+```
+
+
+FB-like signaling pathways
+```{r}
+fb_like_pathways = signaling_changes %>%
+  filter(specificity == "ECMhi specific",
+         cell.type %in% c("P-FB")) %>%
+  group_by(signaling) %>% mutate(Count = n()) %>%
+  filter(cell.type == "P-FB")
+
+fb_like_pathways %>%
+  arrange(desc(outgoing))
+```
+
+
+```{r}
+library(ggrepel)
+
+pathways_oi = c("CXCL", "CCL", "CSF", "PERIOSTIN")
+
+plot_df = signaling_changes %>%
+  filter(
+         #specificity.out.in %in% c("Outgoing specific", "Incoming & Outgoing specific"),
+         cell.type %in% c("P-FB"))
+
+p = ggplot(plot_df %>% filter(signaling %in% pathways_oi), aes(x = incoming, y = outgoing, color = signaling)) +
+  geom_point() +
+  geom_text_repel(aes(label = signaling,  color = signaling), size = 4.5) +
+  theme_cowplot(14) +
+  labs(x = "Incoming interaction strength", y = "Outgoing interaction strength") +
+  theme(legend.position = "none")
+p
+```
+
+
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures/FIG3/", filename= "outgoing_P-FB.pdf", width=4*.8, height=3.7*.8, dpi=700)
+```
+
+
+
+
+```{r}
+library(ggrepel)
+
+pathways_oi = c("ANGPTL", "PDGF", "TGFb", "WNT", "FGF", "IGF")
+
+plot_df = signaling_changes %>%
+  filter(specificity == "ECMhi specific",
+         cell.type %in% c("P-FB"))
+
+p = ggplot(plot_df %>% filter(signaling %in% pathways_oi), aes(x = incoming, y = outgoing, color = signaling)) +
+  geom_point() +
+  geom_text_repel(aes(label = signaling,  color = signaling), size = 4.5, box.padding = .5, label.padding = .7) +
+  theme_cowplot(14) +
+  labs(x = "Incoming interaction strength", y = "Outgoing interaction strength") +
+  theme(legend.position = "none")
+p
+```
+
+
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures", filename= "outgoing_P-FB_stem.pdf", width=4*.8, height=3.7*.8, dpi=700)
+```
+
+
+
+```{r}
+pathways_oi = c("ANGPTL", "PDGF", "TGFb", "WNT", "FGF", "IGF")
+
+plot_df = signaling_changes %>%
+  filter(cell.type %in% c("MES1"))
+
+p = ggplot(plot_df %>% filter(signaling %in% pathways_oi), aes(x = incoming, y = outgoing, color = signaling)) +
+  geom_point() +
+  geom_text_repel(aes(label = signaling,  color = signaling), size = 4.5, box.padding = .5, label.padding = .7) +
+  theme_cowplot(14) +
+  labs(x = "Incoming interaction strength", y = "Outgoing interaction strength") +
+  theme(legend.position = "none") +
+  xlim(0, .006)
+p
+```
+
+
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures/FIG4", filename= "outgoing_MES1_stem.pdf", width=4*.8, height=3.7*.8, dpi=700)
+```
+
+
+```{r}
+pathways_oi = c("ANGPTL", "PDGF", "TGFb", "WNT", "FGF", "IGF")
+
+plot_df = signaling_changes %>%
+  filter(cell.type %in% c("MES2"))
+
+p = ggplot(plot_df %>% filter(signaling %in% pathways_oi), aes(x = incoming, y = outgoing, color = signaling)) +
+  geom_point() +
+  geom_text_repel(aes(label = signaling,  color = signaling), size = 4.5, box.padding = .5, label.padding = .7) +
+  theme_cowplot(14) +
+  labs(x = "Incoming interaction strength", y = "Outgoing interaction strength") +
+  theme(legend.position = "none") +
+  xlim(0, .015)
+p
+```
+
+
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures/FIG4", filename= "outgoing_MES2_stem.pdf", width=4*.8, height=3.7*.8, dpi=700)
+```
+
+
+
+Myeloid cells
+```{r}
+pathways_oi = sort(c("CXCL", "CCL", "CSF", "PERIOSTIN"))
+col_vec = scales::hue_pal()(length(pathways_oi))
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG3/"
+
+for (i in 1:length(pathways_oi)) {
+  pdf(paste0(fig_path, paste0("cellchat_chord_", pathways_oi[i], "_new.pdf")), width = 9.5, height = 5)
+  netVisual_aggregate(object.list$ECMhi,
+                      signaling = pathways_oi[i],
+                      layout = "circle",
+                      label.edge= T,
+                      arrow.size = 1.5,
+                      color.use = rep(col_vec[i], 10),
+                      sources.use = "P-FB",
+                      targets.use = celltype_mapping[celltype_mapping$cell.type=="Myeloid",]$cell.type.fine,
+                      remove.isolate = T,
+                      vertex.label.cex = 1.8)
+  dev.off()
+}
+```
+
+
+
+
+
+
+```{r}
+idents_of_interest = c("P-FB", celltype_mapping[celltype_mapping$cell.type=="Myeloid",]$cell.type.fine)
+
+pathways_oi = sort(c("CXCL", "CCL", "CSF", "PERIOSTIN"))
+```
+
+
+```{r}
+i = 1
+pdf(paste0(fig_path, paste0("netVisual_heatmap_", pathways_oi[i], ".pdf")), width = 3.1, height = 2.4)
+netVisual_heatmap(object.list$ECMhi,
+                  signaling = pathways_oi[i],
+                  color.heatmap = c(0.015, 0),
+                  #sources.use = "P-FB",
+                  #targets.use = celltype_mapping[celltype_mapping$cell.type=="Myeloid",]$cell.type.fine,
+                  row.show = idents_of_interest,
+                  width = 3,
+                  height = 3,
+                  col.show = idents_of_interest)
+dev.off()
+```
+```{r}
+i = 2
+pdf(paste0(fig_path, paste0("netVisual_heatmap_", pathways_oi[i], ".pdf")), width = 3.1, height = 2.4)
+netVisual_heatmap(object.list$ECMhi,
+                  signaling = pathways_oi[i],
+                  #sources.use = "P-FB",
+                  #targets.use = celltype_mapping[celltype_mapping$cell.type=="Myeloid",]$cell.type.fine,
+                  row.show = idents_of_interest,
+                  width = 3,
+                  height = 3,
+                  col.show = idents_of_interest)
+dev.off()
+```
+
+
+```{r}
+i = 3
+pdf(paste0(fig_path, paste0("netVisual_heatmap_", pathways_oi[i], ".pdf")), width = 3.1, height = 2.4)
+netVisual_heatmap(object.list$ECMhi,
+                  signaling = pathways_oi[i],
+                  #sources.use = "P-FB",
+                  #targets.use = celltype_mapping[celltype_mapping$cell.type=="Myeloid",]$cell.type.fine,
+                  row.show = idents_of_interest,
+                  width = 3,
+                  height = 3,
+                  col.show = idents_of_interest)
+dev.off()
+```
+
+
+```{r}
+i = 4
+pdf(paste0(fig_path, paste0("netVisual_heatmap_", pathways_oi[i], ".pdf")), width = 3.1, height = 2.4)
+netVisual_heatmap(object.list$ECMhi,
+                  signaling = pathways_oi[i],
+                  #sources.use = "P-FB",
+                  #targets.use = celltype_mapping[celltype_mapping$cell.type=="Myeloid",]$cell.type.fine,
+                  row.show = idents_of_interest,
+                  width = 3,
+                  height = 3,
+                  col.show = idents_of_interest)
+dev.off()
+```
+
+
+Glioma cells
+
+```{r}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG4/"
+idents_of_interest = c("P-FB", celltype_mapping[celltype_mapping$cell.type=="Glioma",]$cell.type.fine)
+pathways_oi = sort(c("ANGPTL", "PDGF"))
+```
+
+
+```{r}
+i = 1
+pdf(paste0(fig_path, paste0("netVisual_heatmap_", pathways_oi[i], ".pdf")), width = 3.1, height = 2.4)
+netVisual_heatmap(object.list$ECMhi,
+                  signaling = pathways_oi[i],
+                  #sources.use = "P-FB",
+                  #targets.use = celltype_mapping[celltype_mapping$cell.type=="Myeloid",]$cell.type.fine,
+                  row.show = idents_of_interest,
+                  width = 3,
+                  height = 3,
+                  col.show = idents_of_interest)
+dev.off()
+```
+
+```{r}
+i = 2
+pdf(paste0(fig_path, paste0("netVisual_heatmap_", pathways_oi[i], ".pdf")), width = 3.1, height = 2.4)
+netVisual_heatmap(object.list$ECMhi,
+                  signaling = pathways_oi[i],
+                  #sources.use = "P-FB",
+                  #targets.use = celltype_mapping[celltype_mapping$cell.type=="Myeloid",]$cell.type.fine,
+                  row.show = idents_of_interest,
+                  width = 3,
+                  height = 3,
+                  col.show = idents_of_interest)
+dev.off()
+```
+
+
+
+Stem cells
+
+```{r}
+pathways_oi = c("ANGPTL", "FGF", "PDGF", "TGFb")
+col_vec = scales::hue_pal()(4)
+
+for (i in 1:4) {
+  pdf(paste0(fig_path, paste0("cellchat_chord_", pathways_oi[i], ".pdf")), width = 9.5, height = 5)
+  netVisual_aggregate(object.list$ECMhi,
+                      signaling = pathways_oi[i],
+                      layout = "circle",
+                      arrow.size = 1.1,
+                      label.edge= T,
+                      #show.legend = T,
+                      color.use = rep(col_vec[i], 10),
+                      sources.use = "P-FB",
+                      targets.use = celltype_mapping[celltype_mapping$cell.type=="Glioma",]$cell.type.fine,
+                      remove.isolate = T,
+                      vertex.label.cex = 1.8)
+  dev.off()
+}
+```
+
+
+
+## Plotting gene expression
+
+```{r}
+plotGeneExpression(cellchat, signaling = "CCL", split.by = "datasets", colors.ggplot = T)
+```
+
+
+
+
+### DE analysis
+
+```{r, eval=F}
+# define a positive dataset, i.e., the dataset with positive fold change against the other dataset
+pos.dataset = "ECMhi"
+# define a char name used for storing the results of differential expression analysis
+features.name = pos.dataset
+# perform differential expression analysis
+cellchat <- identifyOverExpressedGenes(cellchat, group.dataset = "datasets", pos.dataset = pos.dataset, features.name = features.name, only.pos = FALSE, thresh.pc = 0.1, thresh.fc = 0.1, thresh.p = 1)
+#> Use the joint cell labels from the merged CellChat object
+# map the results of differential expression analysis onto the inferred cell-cell communications to easily manage/subset the ligand-receptor pairs of interest
+net <- netMappingDEG(cellchat, features.name = features.name)
+saveRDS(net, "/Volumes/TOSHIBA/TIMElab/GSE182109_processed/cellchat/netMappingDEG.rds")
+```
+
+```{r}
+net = readRDS("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/cellchat/netMappingDEG.rds")
+# extract the ligand-receptor pairs with upregulated ligands in LS
+net.up <- subsetCommunication(cellchat, net = net, datasets = "ECMhi",
+                              ligand.logFC = 0.2,
+                              receptor.logFC = 0.2)
+# extract the ligand-receptor pairs with upregulated ligands and upregulated recetptors in NL, i.e.,downregulated in LS
+net.down <- subsetCommunication(cellchat, net = net, datasets = "ECMhi",ligand.logFC = -0.1, receptor.logFC = -0.1)
+```
+
+```{r}
+write_tsv(net.up, "/Volumes/TOSHIBA/TIMElab/GSE182109_processed/cellchat/cellchat_net.up.tsv")
+write_tsv(net.down, "/Volumes/TOSHIBA/TIMElab/GSE182109_processed/cellchat/cellchat_net.down.tsv")
+```
+
+#### General analysis
+
+```{r}
+net.up %>% mutate(total.logFC = ligand.logFC + receptor.logFC) %>% arrange(desc(total.logFC)) %>% filter(target %in% c("MES1", "MES2")) %>% View()
+```
+
+
+
+#### Myeloid cells 
+
+From Myeloid
+```{r}
+net.up_sub = net.up %>%
+  filter(source == "P-FB",
+         target %in% celltype_mapping[celltype_mapping$cell.type=="Myeloid",]$cell.type.fine)
+```
+
+```{r}
+pairLR.use.up = net.up_sub[, "interaction_name", drop = F]
+p = netVisual_bubble(cellchat, pairLR.use = pairLR.use.up, targets.use = which(celltype_mapping$cell.type.fine=="FB-like"), sources.use = which(celltype_mapping$cell.type=="Myeloid"), comparison = c(2, 1),  angle.x = 90, remove.isolate = F,title.name = paste0("Up-regulated signaling in ", names(object.list)[1]), color.text = rev(palette_ECM_subtype))
+p
+```
+
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures", filename= "cellchat_netVisual_bubble_Mural_Myeloid_DE.pdf", width=5, height=5.5, dpi=700)
+```
+
+
+
+```{r}
+net.up_sub = net.up %>%
+  filter(source == "FB-like",
+         target %in% celltype_mapping[celltype_mapping$cell.type=="Myeloid",]$cell.type.fine)
+```
+
+```{r}
+pairLR.use.up = net.up_sub[, "interaction_name", drop = F]
+p = netVisual_bubble(cellchat, pairLR.use = pairLR.use.up, sources.use = which(celltype_mapping$cell.type.fine=="FB-like"), targets.use = which(celltype_mapping$cell.type=="Myeloid"), comparison = c(2, 1),  angle.x = 90, remove.isolate = F,title.name = paste0("Up-regulated signaling in ", names(object.list)[1]), color.text = rev(palette_ECM_subtype))
+p
+```
+
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures", filename= "cellchat_netVisual_bubble_Mural_Myeloid_DE.pdf", width=5, height=5.5, dpi=700)
+```
+
+Downregulated
+```{r}
+net.up_sub = net.down %>%
+  filter(source == "FB-like",
+         target %in% celltype_mapping[celltype_mapping$cell.type=="Myeloid",]$cell.type.fine)
+```
+
+```{r}
+pairLR.use.up = net.up_sub[, "interaction_name", drop = F]
+p = netVisual_bubble(cellchat, pairLR.use = pairLR.use.up, sources.use = "FB-like", targets.use = celltype_mapping[celltype_mapping$cell.type=="T cell",]$cell.type.fine, comparison = c(2, 1),  angle.x = 90, remove.isolate = T,title.name = paste0("Up-regulated signaling in ", names(object.list)[1]), color.text = rev(palette_ECM_subtype))
+p
+```
+
+
+#### T cells
+
+```{r}
+net.up_sub = net.up %>%
+  filter(source == "FB-like",
+         target %in% celltype_mapping[celltype_mapping$cell.type=="T cell",]$cell.type.fine)
+```
+
+```{r}
+pairLR.use.up = net.up_sub[, "interaction_name", drop = F]
+p = netVisual_bubble(cellchat, pairLR.use = pairLR.use.up, sources.use = "FB-like", targets.use = celltype_mapping[celltype_mapping$cell.type=="T cell",]$cell.type.fine, comparison = c(2, 1),  angle.x = 90, remove.isolate = T,title.name = paste0("Up-regulated signaling in ", names(object.list)[1]), color.text = rev(palette_ECM_subtype))
+p
+```
+
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures", filename= "cellchat_netVisual_bubble_FB-like_Tcell_DE.pdf", width=4.5, height=4, dpi=700)
+```
+
+
+Down
+```{r}
+net.up_sub = net.down %>%
+  filter(source == "FB-like",
+         target %in% celltype_mapping[celltype_mapping$cell.type=="T cell",]$cell.type.fine)
+```
+
+```{r}
+pairLR.use.up = net.up_sub[, "interaction_name", drop = F]
+p = netVisual_bubble(cellchat, pairLR.use = pairLR.use.up, sources.use = "FB-like", targets.use = celltype_mapping[celltype_mapping$cell.type=="T cell",]$cell.type.fine, comparison = c(2, 1),  angle.x = 90, remove.isolate = T,title.name = paste0("Up-regulated signaling in ", names(object.list)[1]), color.text = rev(palette_ECM_subtype))
+p
+```
+#### Endothelial
+
+```{r}
+net.up_sub = net.up %>%
+  filter(source == "FB-like",
+         target == "Endothelial",
+         ligand.pvalues < .01, receptor.pvalues < .01)
+```
+
+```{r}
+pairLR.use.up = net.up_sub[, "interaction_name", drop = F]
+p = netVisual_bubble(cellchat, pairLR.use = pairLR.use.up, sources.use = "FB-like", targets.use = "Endothelial", comparison = c(2, 1),  angle.x = 90, remove.isolate = T,title.name = paste0("Up-regulated signaling in ", names(object.list)[1]), color.text = rev(palette_ECM_subtype))
+p
+```
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures", filename= "cellchat_netVisual_bubble_FB-like_Endo_DE.pdf", width=2.75, height=4, dpi=700)
+```
+
+
+
+#### Glioma
+
+```{r}
+net.up_sub = net.up %>%
+  filter(source == "P-FB",
+         target %in% celltype_mapping[celltype_mapping$cell.type=="Glioma",]$cell.type.fine)
+```
+
+```{r}
+pairLR.use.up = net.up_sub[, "interaction_name", drop = F]
+p = netVisual_bubble(cellchat, pairLR.use = pairLR.use.up, sources.use = "P-FB", targets.use = which(celltype_mapping$cell.type=="Glioma"), comparison = c(2, 1),  angle.x = 90, remove.isolate = T,title.name = paste0("Up-regulated signaling in ", names(object.list)[1]), color.text = rev(palette_ECM_subtype))
+p
+```
+
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures/FIG4", filename= "cellchat_netVisual_bubble_FB-like_Glioma_DE.pdf", width=4, height=4.5, dpi=700)
+```
+
+```{r}
+plotGeneExpression(cellchat, signaling = "TENASCIN", split.by = "datasets", colors.ggplot = T)
+```
+
+
+
+
+
+#### Myeloid and T cells
+
+Down Myeloid and T cells
+```{r}
+net.down_sub = net.down %>%
+  filter(source %in% c("s-Mac1", "s-Mac2", "MDSC"),
+         target %in% celltype_mapping[celltype_mapping$cell.type=="T cell",]$cell.type.fine,
+         ligand.pvalues < .01, receptor.pvalues < .01)
+```
+
+```{r}
+pairLR.use.down = net.down_sub[, "interaction_name", drop = F]
+p = netVisual_bubble(cellchat, pairLR.use = pairLR.use.down, sources.use = c("s-Mac1", "s-Mac2", "MDSC"), targets.use = which(celltype_mapping$cell.type=="T cell"), comparison = c(2, 1),  angle.x = 90, remove.isolate = F,title.name = paste0("Down-regulated signaling in ", names(object.list)[1]), color.text = rev(palette_ECM_subtype))
+p
+```
+
+
+Up Myeloid and T cells
+
+```{r}
+net.up_sub = net.up %>%
+  filter(source %in% c("s-Mac1", "s-Mac2", "MDSC"),
+         target %in% celltype_mapping[celltype_mapping$cell.type=="T cell",]$cell.type.fine,
+         ligand.pvalues < .01, receptor.pvalues < .01)
+```
+
+```{r}
+pairLR.use.up = net.up_sub[, "interaction_name", drop = F]
+p = netVisual_bubble(cellchat, pairLR.use = pairLR.use.up, sources.use = c("s-Mac1", "s-Mac2", "MDSC"), targets.use = which(celltype_mapping$cell.type=="T cell"), comparison = c(2, 1),  angle.x = 90, remove.isolate = T,title.name = paste0("Down-regulated signaling in ", names(object.list)[1]), color.text = rev(palette_ECM_subtype))
+p
+```
+
+
+Pathways of interest
+```{r}
+cell_types_of_interest = c(celltype_mapping[celltype_mapping$cell.type=="Myeloid",]$cell.type.fine, c("P-FB"))
+object.list_sub = lapply(object.list, subsetCellChat, idents.use = cell_types_of_interest)
+```
+
+
+
+
+
+
+
+
+
+
+## Part II: Identify the conserved and context-specific signaling pathways
+
+Identify signaling groups based on their functional similarity
+```{r}
+cellchat <- computeNetSimilarityPairwise(cellchat, type = "functional")
+cellchat <- netEmbedding(cellchat, type = "functional")
+cellchat <- netClustering(cellchat, type = "functional")
+netVisual_embeddingPairwise(cellchat, type = "functional", label.size = 3.5)
+```
+
+
+```{r}
+netVisual_embeddingPairwiseZoomIn(cellchat, type = "functional", nCol = 2)
+```
+
+
+
+
+
+
+Compute and visualize the pathway distance in the learned joint manifold
+```{r}
+rankSimilarity(cellchat, type = "functional")
+```
+```{r}
+rankSimilarity(cellchat, type = "functional")
+#> Compute the distance of signaling networks between datasets 1 2
+```
+
+
+Identify and visualize the conserved and context-specific signaling pathways
+```{r}
+gg1 <- rankNet(cellchat, mode = "comparison", stacked = T, do.stat = TRUE)
+gg2 <- rankNet(cellchat, mode = "comparison", stacked = F, do.stat = TRUE)
+gg1 + gg2
+```
+
+### Compare outgoing (or incoming) signaling associated with each cell population
+
+
+
+
+```{r}
+pathway.union <- c("HGF", "SAA", "ANGPTL")
+i = 1
+ht1 = netAnalysis_signalingRole_heatmap(object.list[[i]], pattern = "outgoing", signaling = pathway.union, title = names(object.list)[i], width = 5, height = 6)
+ht2 = netAnalysis_signalingRole_heatmap(object.list[[i+1]], pattern = "outgoing", signaling = pathway.union, title = names(object.list)[i+1], width = 5, height = 6)
+draw(ht1 + ht2, ht_gap = unit(0.5, "cm"))
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+pathways.show <- c("HGF") 
+par(mfrow = c(1,2), xpd=TRUE)
+ht <- list()
+for (i in 1:length(object.list)) {
+  ht[[i]] <- netVisual_heatmap(object.list[[i]], signaling = pathways.show, color.heatmap = "Reds",title.name = paste(pathways.show, "signaling ",names(object.list)[i]))
+}
+#> Do heatmap based on a single object 
+#> 
+#> Do heatmap based on a single object
+
+
+pdf(paste0(fig_path, "cellchat_netVisual_heatmap_TENASCIN.pdf"), width = 9.5, height = 5)
+ComplexHeatmap::draw(ht[[1]] + ht[[2]], ht_gap = unit(0.5, "cm"))
+dev.off()
+```
+
+
+```{r}
+sort(object.list[[i]]@netP$pathways)
+```
+
+
+
+```{r}
+pdf(paste0(fig_path, "cellchat_netAnalysis_signalingRole_heatmap_outgoing.pdf"), width = 9.5, height = 5)
+draw(ht1 + ht2, ht_gap = unit(0.5, "cm"))
+dev.off()
+```
+
+
+```{r}
+ht1 = netAnalysis_signalingRole_heatmap(object.list[[i]], pattern = "incoming", signaling = pahtways, title = names(object.list)[i], width = 8, height = 3.5, color.heatmap = "GnBu")
+ht2 = netAnalysis_signalingRole_heatmap(object.list[[i+1]], pattern = "incoming", signaling = pahtways, title = names(object.list)[i+1], width = 8, height = 3.5, color.heatmap = "GnBu")
+draw(ht1 + ht2, ht_gap = unit(0.5, "cm"))
+```
+
+```{r}
+pdf(paste0(fig_path, "cellchat_netAnalysis_signalingRole_heatmap_incoming.pdf"), width = 9.5, height = 5)
+draw(ht1 + ht2, ht_gap = unit(0.5, "cm"))
+dev.off()
+```
+
+
+```{r}
+ht1 = netAnalysis_signalingRole_heatmap(object.list[[i]], pattern = "all", signaling = pahtways, title = names(object.list)[i], width = 7, height = 6, color.heatmap = "GnBu")
+ht2 = netAnalysis_signalingRole_heatmap(object.list[[i+1]], pattern = "all", signaling = pahtways, title = names(object.list)[i+1], width = 7, height = 6, color.heatmap = "GnBu")
+draw(ht1 + ht2, ht_gap = unit(0.5, "cm"))
+```
+
+## Part III: Identify the upgulated and down-regulated signaling ligand-receptor pairs
+
+```{r}
+netVisual_bubble(cellchat, sources.use = 4, targets.use = c(5:11),  comparison = c(1, 2), angle.x = 45)
+#> Comparing communications on a merged object
+```
+
+```{r}
+netVisual_hierarchy1(cellchat,
+                     signaling = "ANGPTL",
+                     sources.use = "Pericyte",
+                     targets.use = c("MES1", "MES2"))
+```
+
+
+
+
+
+
+
+```{r}
+
+gg1 + gg2
+
+```
+
+
+
+```{r}
+pdf(paste0(fig_path, "netVisual_aggregate_ANGPTL.pdf"), width = 9.5*1.1, height = 5*1.1)
+pathways.show <- c("ANGPTL")
+weight.max <- getMaxWeight(object.list, slot.name = c("netP"), attribute = pathways.show) # control the edge weights across different datasets
+par(mfrow = c(1,2), xpd=TRUE)
+for (i in 1:length(object.list)) {
+  netVisual_aggregate(object.list[[i]], signaling = pathways.show, layout = "hierarchy", edge.weight.max = weight.max[1], edge.width.max = 10, signaling.name = paste(pathways.show, names(object.list)[i]))
+}
+dev.off()
+```
+
+```{r}
+pdf(paste0(fig_path, "netVisual_aggregate_CCL.pdf"), width = 9.5*1.1, height = 5*1.1)
+pathways.show <- c("CCL") 
+weight.max <- getMaxWeight(object.list, slot.name = c("netP"), attribute = pathways.show) # control the edge weights across different datasets
+par(mfrow = c(1,2), xpd=TRUE)
+for (i in 1:length(object.list)) {
+  netVisual_aggregate(object.list[[i]], signaling = pathways.show, layout = "circle", edge.weight.max = weight.max[1], edge.width.max = 10, signaling.name = paste(pathways.show, names(object.list)[i]))
+}
+dev.off()
+```
+
+
+
+
+```{r}
+pathways.show <- c("COLLAGEN") 
+weight.max <- getMaxWeight(object.list, slot.name = c("netP"), attribute = pathways.show) # control the edge weights across different datasets
+par(mfrow = c(1,2), xpd=TRUE)
+for (i in 1:length(object.list)) {
+  netVisual_aggregate(object.list[[i]], signaling = pathways.show, layout = "circle", edge.weight.max = weight.max[1], edge.width.max = 10, signaling.name = paste(pathways.show, names(object.list)[i]))
+}
+```
+
+
+```{r}
+plotGeneExpression(cellchat, signaling = "EGF", split.by = "datasets", colors.ggplot = T)
+```
+
+
+```{r}
+cellchat@meta$datasets = factor(cellchat@meta$datasets, levels = c("COL1lo", "COL1hi")) # set factor level
+plotGeneExpression(cellchat, signaling = "CCL", split.by = "datasets", colors.ggplot = T)
+```
+
+```{r}
+plotGeneExpression(cellchat, signaling = "VISFATIN", split.by = "datasets", colors.ggplot = T)
+```
+
+```{r}
+plotGeneExpression(cellchat, signaling = "COLLAGEN", split.by = "datasets", colors.ggplot = T)
+```
+
+
+
+
+
+
+
+

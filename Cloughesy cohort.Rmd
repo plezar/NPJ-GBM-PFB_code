@@ -1,0 +1,358 @@
+---
+title: "Clougesy analysis"
+author: "Maksym"
+date: "12/14/2022"
+output: html_document
+---
+
+## Loading libraries
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(edgeR)
+library(ComplexHeatmap)
+library(GEOquery)
+```
+
+## Data preprocessing
+
+Expression data
+```{r}
+exp_mat = read_xlsx("/Volumes/TOSHIBA/TIMElab/Cloughesy/GSE121810_Prins.PD1NeoAdjv.Jul2018.HUGO.PtID.xlsx")
+
+dups = exp_mat$Genes[duplicated(exp_mat$Genes)]
+exp_mat = exp_mat[!exp_mat$Genes%in%dups,]
+
+exp_mat = exp_mat %>% column_to_rownames("Genes") %>% as.matrix()
+```
+
+Metadata
+```{r}
+meta = read_tsv("/Volumes/TOSHIBA/TIMElab/Cloughesy/metadata.txt") %>% drop_na(sample)
+meta$sample = paste(paste0("Pt", as.numeric(str_split(meta$sample, "-", Inf, T)[,2])), meta$treatment.group, sep="_") 
+meta = column_to_rownames(meta, "sample")
+
+overlap_samples = intersect(colnames(exp_mat), rownames(meta))
+
+exp_mat = exp_mat[,overlap_samples]
+meta = meta[overlap_samples,]
+```
+
+Normalization
+```{r}
+dge = DGEList(counts=exp_mat,
+             samples=meta)
+
+keep = filterByExpr(dge)
+dge = dge[keep,,keep.lib.sizes=FALSE]
+dge = calcNormFactors(dge, method = "TMM")
+dge$log2cpm = cpm(dge, log = T)
+```
+
+
+
+
+PCA
+```{r}
+source("util.R")
+plot_PCA(dge$log2cpm,
+         dge$samples,
+         "treatment.group")
+```
+
+```{r}
+sigs = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+```
+
+## ECM subtype calling
+
+```{r}
+library(scrabble)
+
+sigs$ECMhi = sigs$ECMhi[sigs$ECMhi%in%rownames(dge$log2cpm)]
+sigs$ECMlo = sigs$ECMlo[sigs$ECMlo%in%rownames(dge$log2cpm)]
+
+sig_scores = scrabble::score(
+  mat = dge$log2cpm,
+  groups = sigs
+)
+
+hcl_obj = hclust(dist(sig_scores))
+cluster_calls = cutree(hcl_obj, k=2)
+
+Heatmap(t(sig_scores),
+        cluster_columns = hcl_obj,
+        column_split = 2)
+```
+
+
+```{r}
+score_threshold = 0
+
+dge$samples$ECM.cluster = sig_scores %>%
+  as.data.frame() %>%
+  mutate(ECM.cluster = if_else(ECMhi > score_threshold & ECMlo < -(score_threshold), "ECMhi",
+                               if_else(ECMhi < (-score_threshold) & ECMlo > score_threshold, "ECMlo", "undefined"))) %>%
+  pull(ECM.cluster)
+
+Heatmap(t(sig_scores),
+        column_split = factor(dge$samples$ECM.cluster))
+```
+
+```{r,eval=F}
+saveRDS(dge, "/Volumes/TOSHIBA/TIMElab/Cloughesy/Cloughesy_DGEList.rds")
+```
+
+
+```{r}
+dge = readRDS("/Volumes/TOSHIBA/TIMElab/Cloughesy/Cloughesy_DGEList.rds")
+```
+
+
+Hierarchical clustering
+```{r}
+cluster_calls[cluster_calls==1] <- "ECMhi"
+cluster_calls[cluster_calls=="2"] <- "ECMlo"
+
+dge$samples$ECM.cluster.hclust = cluster_calls
+
+Heatmap(t(sig_scores),
+        column_split = factor(dge$samples$ECM.cluster.hclust))
+```
+
+
+## Suvival analysis
+
+```{r}
+library(survminer)
+library(survival)
+
+col_bulk_subtype = c("ECMhi" = "#E64B35FF", "ECMlo" = "#4DBBD5FF")
+
+surv_data = dge$samples %>%
+  mutate(treatment = if_else(treatment.group=="A", "neo", "adj"),
+         group = paste(ECM.cluster, treatment)) %>%
+  filter(ECM.cluster!="undefined")
+
+p1 = ggsurvplot(
+  survfit(Surv(OS, deceased) ~ group, data=surv_data), pval=T, risk.table=F, palette = c("#E64B35FF", "#F39B7fB2", "#4DBBD5FF", "#8491B4B2"), tables.height=.4, legend="right", ylab="OS (%)")
+
+p2 = ggsurvplot(
+  survfit(Surv(OS, deceased) ~ ECM.cluster, data=surv_data), pval=T, risk.table=F, palette = unname(col_bulk_subtype), tables.height=.4, legend="right", ylab="OS (%)")
+```
+
+```{r}
+pdf("/Volumes/TOSHIBA/TIMElab/figures/Cloughesy_ECM_therapy_surv.pdf", width=5.5, height=2.5)
+print(p1, newpage = FALSE)
+dev.off()
+
+pdf("/Volumes/TOSHIBA/TIMElab/figures/Cloughesy_ECM_surv.pdf", width=5.5, height=2.5)
+print(p2, newpage = FALSE)
+dev.off()
+```
+
+```{r}
+p1 = ggsurvplot(
+  survfit(Surv(PFS, progression) ~ group, data=surv_data), pval=T, risk.table=F, palette = c("#E64B35FF", "#F39B7fB2", "#4DBBD5FF", "#8491B4B2"), tables.height=.4, legend="right", ylab="PFS (%)", pval.coord = c(300, .5))
+
+p2 = ggsurvplot(
+  survfit(Surv(PFS, progression) ~ ECM.cluster, data=surv_data), pval=T, risk.table=F, palette = unname(col_bulk_subtype), tables.height=.4, legend="right", ylab="PFS (%)", pval.coord = c(300, .5))
+```
+```{r}
+surv_data %>% arrange(desc(PFS))
+```
+
+
+
+```{r}
+pdf("/Volumes/TOSHIBA/TIMElab/figures/Cloughesy_ECM_therapy_pfs.pdf", width=5.5, height=2.5)
+print(p1, newpage = FALSE)
+dev.off()
+
+pdf("/Volumes/TOSHIBA/TIMElab/figures/Cloughesy_ECM_surv_pfs.pdf", width=5.5, height=2.5)
+print(p2, newpage = FALSE)
+dev.off()
+```
+
+
+
+
+
+## CAF deconvolution
+
+```{r}
+load("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/muralcell/mural_subcluster_signatures_test.RData")
+```
+
+Scoring
+
+```{r}
+sinature_list = lapply(sinature_list, function(x) {x[x%in%rownames(dge)]})
+sinature_list_unique = lapply(sinature_list_unique, function(x) {x[x%in%rownames(dge)]})
+```
+
+
+```{r}
+sig_scores = scrabble::score(
+  mat = dge$log2cpm,
+  groups = sinature_list_unique
+)
+
+dge$samples$MFB_score <- sig_scores[,"M-FB"]
+dge$samples$PFB_score <- sig_scores[,"P-FB"]
+dge$samples$PC_score <- sig_scores[,"PC"]
+dge$samples$SMC_score <- sig_scores[,"SMC"]
+```
+
+
+```{r}
+dge$samples$MFB.enrich <- NA
+dge$samples$MFB.enrich[dge$samples$MFB_score < quantile(dge$samples$MFB_score)[4]] <- "low"
+dge$samples$MFB.enrich[dge$samples$MFB_score > quantile(dge$samples$MFB_score)[4]] <- "high"
+
+dge$samples$PFB.enrich <- NA
+dge$samples$PFB.enrich[dge$samples$PFB_score < quantile(dge$samples$PFB_score)[4]] <- "low"
+dge$samples$PFB.enrich[dge$samples$PFB_score > quantile(dge$samples$PFB_score)[4]] <- "high"
+
+dge$samples$PC.enrich <- NA
+dge$samples$PC.enrich[dge$samples$PC_score < quantile(dge$samples$PC_score)[4]] <- "low"
+dge$samples$PC.enrich[dge$samples$PC_score > quantile(dge$samples$PC_score)[4]] <- "high"
+
+dge$samples$SMC.enrich <- NA
+dge$samples$SMC.enrich[dge$samples$SMC_score < quantile(dge$samples$SMC_score)[4]] <- "low"
+dge$samples$SMC.enrich[dge$samples$SMC_score > quantile(dge$samples$SMC_score)[4]] <- "high"
+```
+
+
+#### PVFB
+
+```{r}
+library(survminer)
+library(survival)
+
+palette_ECM_subtype = c("ECMhi" = "#E64B35FF", "ECMlo" = "#4DBBD5FF")
+
+surv_data = dge$samples %>%
+  filter(!is.na(PFB.enrich)) %>%
+  mutate(treatment = if_else(treatment.group=="A", "neo", "adj"),
+         group = paste(PFB.enrich, treatment))
+
+p1 = ggsurvplot(
+  survfit(Surv(OS, deceased) ~ group, data=surv_data), pval=T, risk.table=F, palette = c("#E64B35FF", "#F39B7fB2", "#4DBBD5FF", "#8491B4B2"), tables.height=.4, legend="none", ylab="OS (%)", xlab = "Time (days)")
+
+p2 = ggsurvplot(
+  survfit(Surv(OS, deceased) ~ PFB.enrich, data=surv_data), pval=T, risk.table=F, palette = (unname(palette_ECM_subtype)), tables.height=.4, legend="none", ylab="OS (%)", xlab = "Time (days)")
+
+p1
+p2
+```
+
+```{r}
+pdf("/Volumes/TOSHIBA/TIMElab/figures/FIG2/Cloughesy_PFB_therapy_surv.pdf", width=3.5, height=2.5)
+print(p1, newpage = FALSE)
+dev.off()
+
+pdf("/Volumes/TOSHIBA/TIMElab/figures/FIG2/Cloughesy_PFB_surv.pdf", width=3.5, height=2.5)
+print(p2, newpage = FALSE)
+dev.off()
+```
+
+#### MFB
+
+```{r}
+library(survminer)
+library(survival)
+
+palette_ECM_subtype = c("ECMhi" = "#E64B35FF", "ECMlo" = "#4DBBD5FF")
+
+surv_data = dge$samples %>%
+  filter(!is.na(MFB.enrich)) %>%
+  mutate(treatment = if_else(treatment.group=="A", "neo", "adj"),
+         group = paste(MFB.enrich, treatment))
+
+p1 = ggsurvplot(
+  survfit(Surv(OS, deceased) ~ group, data=surv_data), pval=T, risk.table=F, palette = c("#E64B35FF", "#F39B7fB2", "#4DBBD5FF", "#8491B4B2"), tables.height=.4, legend="none", ylab="OS (%)", xlab = "Time (days)")
+
+p2 = ggsurvplot(
+  survfit(Surv(OS, deceased) ~ MFB.enrich, data=surv_data), pval=T, risk.table=F, palette = (unname(palette_ECM_subtype)), tables.height=.4, legend="none", ylab="OS (%)", xlab = "Time (days)")
+
+p1
+p2
+```
+
+```{r}
+pdf("/Volumes/TOSHIBA/TIMElab/figures/FIG2/Cloughesy_MFB_therapy_surv.pdf", width=3.5, height=2.5)
+print(p1, newpage = FALSE)
+dev.off()
+
+pdf("/Volumes/TOSHIBA/TIMElab/figures/FIG2/Cloughesy_MFB_surv.pdf", width=3.5, height=2.5)
+print(p2, newpage = FALSE)
+dev.off()
+```
+#### PC
+
+```{r}
+library(survminer)
+library(survival)
+
+palette_ECM_subtype = c("ECMhi" = "#E64B35FF", "ECMlo" = "#4DBBD5FF")
+
+surv_data = dge$samples %>%
+  filter(!is.na(PC.enrich)) %>%
+  mutate(treatment = if_else(treatment.group=="A", "neo", "adj"),
+         group = paste(PC.enrich, treatment))
+
+p1 = ggsurvplot(
+  survfit(Surv(OS, deceased) ~ group, data=surv_data), pval=T, risk.table=F, palette = c("#E64B35FF", "#F39B7fB2", "#4DBBD5FF", "#8491B4B2"), tables.height=.4, legend="none", ylab="OS (%)", xlab = "Time (days)")
+
+p2 = ggsurvplot(
+  survfit(Surv(OS, deceased) ~ PC.enrich, data=surv_data), pval=T, risk.table=F, palette = (unname(palette_ECM_subtype)), tables.height=.4, legend="none", ylab="OS (%)", xlab = "Time (days)")
+
+p1
+p2
+```
+
+```{r}
+pdf("/Volumes/TOSHIBA/TIMElab/figures/FIG2/Cloughesy_PC_therapy_surv.pdf", width=3.5, height=2.5)
+print(p1, newpage = FALSE)
+dev.off()
+
+pdf("/Volumes/TOSHIBA/TIMElab/figures/FIG2/Cloughesy_PC_surv.pdf", width=3.5, height=2.5)
+print(p2, newpage = FALSE)
+dev.off()
+```
+
+
+#### SMC
+
+```{r}
+library(survminer)
+library(survival)
+
+palette_ECM_subtype = c("ECMhi" = "#E64B35FF", "ECMlo" = "#4DBBD5FF")
+
+surv_data = dge$samples %>%
+  filter(!is.na(SMC.enrich)) %>%
+  mutate(treatment = if_else(treatment.group=="A", "neo", "adj"),
+         group = paste(SMC.enrich, treatment))
+
+p1 = ggsurvplot(
+  survfit(Surv(OS, deceased) ~ group, data=surv_data), pval=T, risk.table=F, palette = c("#E64B35FF", "#F39B7fB2", "#4DBBD5FF", "#8491B4B2"), tables.height=.4, legend="none", ylab="OS (%)", xlab = "Time (days)")
+
+p2 = ggsurvplot(
+  survfit(Surv(OS, deceased) ~ SMC.enrich, data=surv_data), pval=T, risk.table=F, palette = (unname(palette_ECM_subtype)), tables.height=.4, legend="none", ylab="OS (%)", xlab = "Time (days)")
+
+p1
+p2
+```
+
+```{r}
+pdf("/Volumes/TOSHIBA/TIMElab/figures/FIG2/Cloughesy_SMC_therapy_surv.pdf", width=3.5, height=2.5)
+print(p1, newpage = FALSE)
+dev.off()
+
+pdf("/Volumes/TOSHIBA/TIMElab/figures/FIG2/Cloughesy_SMC_surv.pdf", width=3.5, height=2.5)
+print(p2, newpage = FALSE)
+dev.off()
+```

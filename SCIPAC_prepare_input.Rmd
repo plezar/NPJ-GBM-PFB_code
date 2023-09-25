@@ -1,0 +1,86 @@
+---
+title: "SCIPAC_prepare_input"
+output: html_document
+date: "2023-02-16"
+---
+
+```{r}
+library(Seurat)
+library(SCIPAC)
+```
+
+```{r}
+seurat_obj = readRDS("/Volumes/TOSHIBA/TIMElab/GSE186344/seurat_obj.rds")
+DefaultAssay(seurat_obj) <- "RNA"
+sc.meta = seurat_obj@meta.data
+```
+
+```{r}
+seurat_obj <- NormalizeData(seurat_obj)
+seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+```
+
+
+
+```{r}
+pwd = "/Volumes/TOSHIBA/TIMElab/GSE164150_RAW/"
+dge = readRDS(paste0(pwd, "BMets_DGEList.rds"))
+dge = dge[,dge$samples$ECM.cluster!="mixed"]
+```
+
+Phenotype annotation
+NB! NFs were classified manually due to only 1 ECMlo sample
+```{r, eval=F}
+y <- factor(ifelse(dge$samples$ECMhi > 1.2, 1, 0), levels = c(0, 1))
+```
+
+Phenotype annotation
+NB! Meningiomas were classified manually due to only 1 ECMlo sample
+```{r}
+plot(dge$samples$ECMhi, dge$samples$ECMlo)
+```
+
+
+```{r, eval=F}
+y <- factor(ifelse(dge$samples$ECMhi > 1.2, 1, 0), levels = c(0, 1))
+```
+
+```{r}
+y = factor(dge$samples$ECM.cluster, levels = c("ECMlo", "ECMhi"))
+levels(y) = c(0, 1)
+y
+```
+
+
+
+
+```{r}
+top_var_overlap = intersect(seurat_obj@assays$RNA@var.features, rownames(dge))
+```
+
+```{r}
+sc.dat.prep = as.matrix(seurat_obj@assays$RNA@data[top_var_overlap,])
+bulk.dat.prep = dge$counts[top_var_overlap,]
+```
+
+
+SCIPAC
+
+```{r}
+pca.res <- sc.bulk.pca(sc.dat.prep, bulk.dat.prep, do.pca.sc = F, n.pc = 25)
+```
+
+```{r}
+sc.dat.dim.redu <- pca.res$sc.dat.rot
+bulk.dat.dim.redu <- pca.res$bulk.dat.rot
+```
+
+```{r}
+ct.res <- seurat.ct(sc.dat.dim.redu, res = 1.5)
+```
+
+
+```{r}
+save(ct.res, bulk.dat.dim.redu, y, sc.meta, file =  "/Volumes/TOSHIBA/TIMElab/GSE186344/SCIPAC_data.RData")
+```
+

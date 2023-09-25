@@ -1,0 +1,100 @@
+---
+title: "Stromal_integration"
+author: "Maksym"
+date: "3/8/2023"
+output: html_document
+---
+
+```{r}
+library(Seurat)
+library(SeuratData)
+library(SeuratWrappers)
+library(tidyverse)
+```
+
+Load data
+```{r}
+lgpt = readRDS("/Volumes/TOSHIBA/TIMElab/SCPCP000002/stromal_cells.rds")
+meningioma = readRDS("/Volumes/TOSHIBA/TIMElab/Wang_Meningioma/stromal_cells.rds")
+nf = readRDS("/Volumes/TOSHIBA/TIMElab/GSE163028_RAW/stromal_cells.rds")
+mets = readRDS("/Volumes/TOSHIBA/TIMElab/GSE186344/stromal_cells.rds")
+gbm = readRDS("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/muralcells.rds")
+DefaultAssay(gbm) <- "RNA"
+```
+
+```{r}
+meningioma$cell.type <- meningioma$Final_celltype
+mets$cell.type <- mets$Cell_Type
+gbm$cell.type <- gbm$cell.type.fine
+```
+
+```{r}
+overlapping_genes = Reduce(intersect, list(
+  rownames(lgpt),
+  rownames(meningioma),
+  rownames(nf),
+  rownames(mets),
+  rownames(gbm)
+))
+```
+
+```{r}
+count_data = cbind(
+  lgpt@assays$RNA@counts[overlapping_genes,],
+  meningioma@assays$RNA@counts[overlapping_genes,],
+  #nf@assays$RNA@counts[overlapping_genes,],
+  mets@assays$RNA@counts[overlapping_genes,],
+  gbm@assays$RNA@counts[overlapping_genes,]
+  )
+```
+
+```{r}
+metadata = rbind(
+  lgpt@meta.data %>% select(cell.type) %>% mutate(Dataset = "PLGG"),
+  meningioma@meta.data %>% select(cell.type) %>% mutate(Dataset = "Meningioma"),
+  #nf@meta.data %>% select(cell.type),
+  mets@meta.data %>% select(cell.type) %>% mutate(Dataset = "BMets"),
+  gbm@meta.data %>% select(cell.type) %>% mutate(Dataset = "GBM")
+)
+```
+
+```{r}
+seurat_obj = CreateSeuratObject(
+  counts = count_data,
+  meta.data = metadata
+)
+
+nf = CreateSeuratObject(
+  counts = nf@assays$RNA@counts[overlapping_genes,],
+  meta.data = nf@meta.data %>% select(cell.type) %>% mutate(Dataset = "NF")
+)
+```
+
+```{r}
+seurat_obj <- NormalizeData(seurat_obj)
+seurat_obj <- merge(seurat_obj, y = nf)
+table(seurat_obj$Dataset)
+```
+
+```{r}
+rm(lgpt, meningioma, nf, mets, gbm)
+```
+
+```{r}
+seurat_obj <- FindVariableFeatures(seurat_obj)
+
+seurat_obj_integrated <- RunFastMNN(object.list = SplitObject(seurat_obj, split.by = "Dataset"))
+seurat_obj_integrated <- RunUMAP(seurat_obj_integrated, reduction = "mnn", dims = 1:15)
+seurat_obj_integrated <- FindNeighbors(seurat_obj_integrated, reduction = "mnn", dims = 1:15)
+seurat_obj_integrated <- FindClusters(seurat_obj_integrated)
+```
+
+```{r}
+DimPlot(seurat_obj_integrated, group.by = c("Dataset"), label = T)
+DimPlot(seurat_obj_integrated, group.by = c("cell.type"), label = T)
+```
+
+```{r}
+saveRDS(seurat_obj_integrated, "/Volumes/TOSHIBA/TIMElab/stromal_integration.rds")
+```
+

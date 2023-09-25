@@ -1,0 +1,328 @@
+---
+title: "Wang_meningioma"
+author: "Maksym"
+date: "3/8/2023"
+output: html_document
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+```
+
+Data taken from here https://genomemedicine.biomedcentral.com/articles/10.1186/s13073-022-01051-9
+
+```{r}
+seurat_obj = readRDS("/Users/plezar/Downloads/Final_Aggregated_Dura.rds")
+```
+
+```{r}
+table(seurat_obj$Sample)
+```
+
+## Pseudobulk samples
+
+```{r}
+library(scuttle)
+library(edgeR)
+
+DefaultAssay(seurat_obj) <- "RNA"
+
+merged_sce <- as.SingleCellExperiment(DietSeurat(seurat_obj))
+merged_sce@assays@data$logcounts <- NULL
+summed <- aggregateAcrossCells(merged_sce, 
+                               id=colData(merged_sce)[,c("Sample")],
+                               use.assay.type = 1)
+y <- DGEList(counts(summed), samples=colData(summed))
+
+discarded <- summed$ncells < 10
+y <- y[,!discarded]
+
+keep <- filterByExpr(y)
+y <- y[keep,]
+y <- calcNormFactors(y)
+plotMDS(cpm(y, log=TRUE))
+y$log2cpm = cpm(y, log=TRUE)
+```
+
+
+
+### ECM subtyping
+
+```{r}
+sigs = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+```
+
+```{r}
+library(scrabble)
+library(ComplexHeatmap)
+library(tidyverse)
+
+sigs$ECMhi = sigs$ECMhi[sigs$ECMhi%in%rownames(y)]
+sigs$ECMlo = sigs$ECMlo[sigs$ECMlo%in%rownames(y)]
+
+sig_scores = scrabble::score(
+  mat = y$log2cpm,
+  groups = sigs
+)
+
+y$samples$ECMhi.score = sig_scores[,"ECMhi"]
+y$samples$ECMlo.score = sig_scores[,"ECMlo"]
+
+score_threshold = 0
+
+y$samples$ECM.cluster = sig_scores %>%
+  as.data.frame() %>%
+  mutate(ECM.cluster = if_else(ECMhi > score_threshold & ECMlo < -(score_threshold), "ECMhi",
+                               if_else(ECMhi < (-score_threshold) & ECMlo > score_threshold, "ECMlo", "undefined"))) %>%
+  pull(ECM.cluster)
+```
+
+```{r}
+library(circlize)
+
+hcl = hclust(dist(sig_scores, method = "maximum"), method = "average")
+
+ht = Heatmap(t(sig_scores),
+        name = "Signature score",
+        column_split = factor(y$samples$ECM.cluster),
+        show_column_dend = F,
+        show_row_dend = F,
+        show_column_names = F,
+        col = colorRamp2(seq(-.5, .5, length.out=11), colorRampPalette(c("#4DBBD5FF", "#E64B35FF"))(11)),
+        width = unit(11, "cm"), 
+        height = unit(.75, "cm"))
+
+ht
+```
+
+
+```{r}
+seurat_obj$ECM.cluster =  seurat_obj@meta.data %>%
+  left_join(
+    y$samples %>% select(Sample, ECM.cluster), "Sample"
+  ) %>% pull(ECM.cluster)
+```
+
+
+Cell frequencies in each subtype
+
+```{r}
+library(cowplot)
+
+celltype_freq = seurat_obj@meta.data %>%
+  group_by(ECM.cluster, Final_celltype) %>%
+  summarise(Count = n()) %>%
+  mutate(Prop = Count/sum(Count)) %>%
+  filter(ECM.cluster!="undefined")
+
+ggplot(celltype_freq, aes(fill=Final_celltype, x=ECM.cluster, y = Prop)) + 
+    geom_bar(position="fill", stat="identity") +
+    geom_text(aes(label=Count), 
+            position=position_stack(vjust=0.5)) +
+  #scale_fill_manual(values = barplot_pal) +
+  ylab("Frequency") +
+  xlab(NULL) +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  coord_flip()
+```
+
+```{r}
+saveRDS(seurat_obj, "/Volumes/TOSHIBA/TIMElab/Wang_Meningioma/seurat_obj.rds")
+```
+
+
+## Matrisome expression
+
+```{r}
+matrisome_d = readxl::read_xlsx("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/matrisome_hs_masterlist.xlsx")
+core_matrisome_d = matrisome_d %>% filter(Division=="Core matrisome")
+core_matrisome_d = core_matrisome_d[core_matrisome_d$`Gene Symbol`%in%rownames(seurat_obj),]
+```
+
+Courtesy of raveancic
+```{r}
+PrctCellExpringGene <- function(object, genes, group.by = "all"){
+    if(group.by == "all"){
+        prct = unlist(lapply(genes,calc_helper, object=object))
+        result = data.frame(Markers = genes, Cell_proportion = prct)
+        return(result)
+    }
+
+    else{        
+        list = SplitObject(object, group.by)
+        factors = names(list)
+
+        results = lapply(list, PrctCellExpringGene, genes=genes)
+        for(i in 1:length(factors)){
+        results[[i]]$Feature = factors[i]
+        }
+        combined = do.call("rbind", results)
+        return(combined)
+    }
+}
+
+calc_helper <- function(object,genes){
+    counts = object[['RNA']]@counts
+    ncells = ncol(counts)
+    if(genes %in% row.names(counts)){
+    sum(counts[genes,]>0)/ncells
+    }else{return(NA)}
+}
+```
+
+```{r}
+prct_expressed = PrctCellExpringGene(seurat_obj, core_matrisome_d$`Gene Symbol`, group.by = "Final_celltype")
+rownames(prct_expressed) = 1:nrow(prct_expressed)
+```
+
+
+```{r}
+highly_expressed = unique(prct_expressed$Markers[prct_expressed$Cell_proportion>.1])
+```
+
+
+```{r}
+p = DotPlot(
+  seurat_obj, cluster.idents = T,
+  scale = F,
+  features = core_matrisome_d[core_matrisome_d$`Gene Symbol`%in%highly_expressed,]$`Gene Symbol`
+) + coord_flip() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + scale_colour_gradient2(low = "#3C5488FF", mid = "grey", high = "#DC0000FF")
+
+p
+```
+
+```{r}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG1/BrainMets"
+ggsave(p, path=fig_path, filename= "matrisome_expression.pdf", width=8, height=20, dpi = 700)
+```
+
+
+## Annotation
+
+```{r}
+DefaultAssay(seurat_obj) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
+seurat_obj <- RunPCA(seurat_obj, npcs = 30, verbose = FALSE)
+
+seurat_obj <- RunUMAP(seurat_obj, reduction = "pca", dims = 1:10)
+seurat_obj <- FindNeighbors(seurat_obj, reduction = "pca", dims = 1:10)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.3)
+
+DimPlot(seurat_obj)
+```
+
+```{r}
+Idents(seurat_obj) = "integrated_snn_res.0.3"
+DotPlot(
+  seurat_obj,
+  features = c("COL1A1", "DCN", "LUM", "PECAM1", "CDH5", "VWF", "ACTA2", "TAGLN", "RGS5", "PTPRC"),
+  cluster.idents = T
+) + coord_flip()
+```
+
+```{r}
+Idents(seurat_obj) <- "integrated_snn_res.0.3"
+seurat_obj <- RenameIdents(object = seurat_obj, 
+                              "0" = "Immune",
+                              "1" = "Endothelial",
+                              "2" = "Immune",
+                              "3" = "Fibroblast",
+                              "4" = "Fibroblast",
+                              "5" = "Endothelial",
+                              "6" = "Mural cell",
+                              "7" = "Endothelial",
+                              "8" = "Fibroblast",
+                           "9" = "Immune",
+                           "10" = "Immune",
+                           "11" = "Immune")
+seurat_obj$cell.type = Idents(seurat_obj)
+DimPlot(seurat_obj, label = TRUE)
+```
+
+```{r}
+saveRDS(seurat_obj, "/Volumes/TOSHIBA/TIMElab/Wang_Meningioma/seurat_obj.rds")
+```
+
+## Subclustering stromal cells
+
+```{r}
+seurat_obj = subset(seurat_obj, idents = c("Mesenchymal subtypes", "Endothelial subtypes"))
+```
+
+```{r}
+seurat_obj = DietSeurat(seurat_obj)
+```
+
+```{r}
+seurat_obj <- NormalizeData(seurat_obj)
+seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+seurat_obj <- ScaleData(seurat_obj)
+seurat_obj <- RunPCA(seurat_obj, features = VariableFeatures(object = seurat_obj))
+ElbowPlot(seurat_obj)
+```
+
+
+```{r}
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:8)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.5)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:8)
+Idents(seurat_obj) <- "Final_celltype"
+DimPlot(seurat_obj)
+```
+
+```{r}
+saveRDS(seurat_obj, "/Volumes/TOSHIBA/TIMElab/Wang_Meningioma/stromal_cells.rds")
+```
+
+
+## SCIPAC
+
+```{r}
+load("/Volumes/TOSHIBA/TIMElab/Wang_Meningioma/SCIPAC_data.RData")
+seurat_obj = readRDS("/Volumes/TOSHIBA/TIMElab/Wang_Meningioma/seurat_obj.rds")
+```
+
+```{r}
+library(SCIPAC)
+SCIPAC.res <- SCIPAC(bulk.dat = bulk.dat.dim.redu, y = y,
+                     nfold = 29,
+                     family = "binomial", ct.res = ct.res)
+
+SCIPAC.res
+```
+
+
+```{r}
+seurat_obj@meta.data = seurat_obj@meta.data %>%
+  rownames_to_column("cell_id") %>%
+  left_join(
+    SCIPAC.res %>% rownames_to_column("cell_id") %>% select(cell_id, Lambda.est,  Lambda.upper, Lambda.lower, sig, log.pval)
+  ) %>%
+  column_to_rownames("cell_id")
+```
+
+
+```{r}
+p = DimPlot(seurat_obj,
+        group.by = "sig",
+        cols = c("#E64B35FF", "#4DBBD5FF", "#ededed")) + NoLegend()
+p
+```
+
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/Wang_Meningioma", filename= "Meningioma_SCIPAC.pdf", width=5.1, height=5.1, dpi=700)
+```
+
+
+```{r}
+p = DimPlot(seurat_obj, label = T,  label.size = 7, pt.size = .1, cols = c('#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf')) + NoLegend()
+p
+```
+
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/Wang_Meningioma", filename= "Meningioma_UMAP.pdf", width=5.1, height=5, dpi=700)
+```

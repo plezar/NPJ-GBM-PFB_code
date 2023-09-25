@@ -1,0 +1,61 @@
+---
+title: "CGGA preprocess"
+author: "Maksym"
+date: "7/23/2022"
+output: html_document
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readr)
+  library(SummarizedExperiment)
+  library(edgeR)
+})
+```
+
+```{r}
+cgga693Env = new.env()
+cgga325Env = new.env()
+```
+
+Reading data
+```{r}
+cgga325Env$edata = read_tsv("data/CGGA/CGGA.mRNAseq_325.Read_Counts-genes.20220620.txt") %>% column_to_rownames("gene_name")
+cgga693Env$edata = read_tsv("data/CGGA/CGGA.mRNAseq_693.Read_Counts-genes.20220620.txt") %>% column_to_rownames("gene_name")
+```
+
+```{r}
+cgga325Env$sdata = read_tsv("data/CGGA/CGGA.mRNAseq_325_clinical.20200506.txt") %>% mutate(Batch = "CGGA_325")
+cgga693Env$sdata = read_tsv("data/CGGA/CGGA.mRNAseq_693_clinical.20200506.txt") %>% mutate(Batch = "CGGA_693")
+
+for (e in c(cgga693Env, cgga325Env)) {
+  e$sdata = column_to_rownames(e$sdata, "CGGA_ID")
+  print(ncol(e$edata) == nrow(e$sdata))
+  e$edata = e$edata[,rownames(e$sdata)]
+}
+```
+
+Normalization
+```{r}
+for (e in c(cgga693Env, cgga325Env)) {
+  dge = DGEList(counts=e$edata,
+               samples=e$sdata)
+  
+  keep = filterByExpr(dge)
+  dge = dge[keep,,keep.lib.sizes=FALSE]
+  dge = calcNormFactors(dge, method = "TMM")
+  dge$cpm = cpm(dge)
+  e$dge = dge
+}
+
+# Show top genes
+#topGenes = topTable(fit, coef="groupPrimary solid Tumor_TCGA-GBM", number=Inf, sort.by="p")
+# ...
+```
+
+```{r,eval=F}
+saveRDS(cgga693Env$dge, "data/CGGA693_DGEList.rds")
+saveRDS(cgga325Env$dge, "data/CGGA325_DGEList.rds")
+```
+

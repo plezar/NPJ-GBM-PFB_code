@@ -1,0 +1,463 @@
+---
+title: "GBM single-cell"
+author: "Maksym"
+date: "7/21/2022"
+output: html_document
+---
+
+Packages
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(stringr)
+  library(purrr)
+  library(tidyverse)
+  library(DoubletFinder)
+  library(RColorBrewer)
+})
+```
+
+Parallel execution
+```{r}
+library(doParallel)
+library(foreach)
+no_cores <- detectCores()
+cl <- makeCluster(no_cores)
+registerDoParallel(cl)
+```
+
+Adds necessary metadata for sclean algo
+```{r, echo=F}
+add_meta_seurat <- function(obj) {
+  obj$log10GenesPerUMI <- log10(obj$nFeature_RNA) / log10(obj$nCount_RNA)
+  
+  pct_counts_in_top_20_features_fun <- function(cell, obj){
+    sum(sort(obj@assays$RNA@counts[,cell], decreasing = TRUE)[1:20])/sum(obj@assays$RNA@counts[,cell])
+  }
+  
+  x = foreach(cell=Cells(obj), .packages = "Seurat") %dopar% pct_counts_in_top_20_features_fun(cell, obj)
+  obj$pct_counts_in_top_20_features = unlist(x)
+  
+  obj$mitoRatio <- PercentageFeatureSet(object = obj, pattern = "^MT-")
+  obj$mitoRatio <- obj@meta.data$mitoRatio / 100
+  obj$rpsRatio <- PercentageFeatureSet(object = obj, pattern = "^RPS-")
+  obj$rplRatio <- PercentageFeatureSet(object = obj, pattern = "^RPL-")
+  obj$riboRatio <- obj$rpsRatio + obj$rplRatio
+  obj@meta.data <- obj@meta.data %>%
+    dplyr::rename(seq_folder = orig.ident,
+                  nUMI = nCount_RNA,
+                  nGene = nFeature_RNA)
+  return(obj)
+}
+
+filter_seurat_paper <- function(obj) {
+  subset(obj, subset = nGene >= 500 & mitoRatio <= .2 & riboRatio <= .5)
+}
+```
+
+DoubetFinder function for Seurat
+```{r}
+detect_doublets <- function(obj) {
+  obj <- NormalizeData(object = obj)
+  obj <- FindVariableFeatures(object = obj)
+  obj <- ScaleData(object = obj)
+  obj <- RunPCA(object = obj)
+  obj <- FindNeighbors(object = obj, dims = 1:10)
+  obj <- FindClusters(object = obj)
+  obj <- RunUMAP(object = obj, dims = 1:10)
+  
+  ## pK Identification (no ground-truth) ---------------------------------------------------------------------------------------
+  sweep.res.list_pbmc <- paramSweep_v3(obj, PCs = 1:10, sct = FALSE)
+  sweep.stats_pbmc <- summarizeSweep(sweep.res.list_pbmc, GT = FALSE)
+  bcmvn_pbmc <- find.pK(sweep.stats_pbmc)
+  
+  pK <- bcmvn_pbmc %>%
+    filter(BCmetric == max(BCmetric)) %>%
+    pull(pK) %>%
+    as.numeric()
+  
+  ## Homotypic Doublet Proportion Estimate -------------------------------------------------------------------------------------
+  annotations <- obj@meta.data$seurat_clusters
+  homotypic.prop <- modelHomotypic(annotations)
+  nExp_poi <- round(0.076*nrow(obj@meta.data))
+  nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+  
+  # run doubletFinder 
+  obj <- doubletFinder_v3(obj, 
+                                       PCs = 1:10, 
+                                       pN = 0.25, 
+                                       pK = pK, 
+                                       nExp = nExp_poi.adj,
+                                       reuse.pANN = FALSE,
+                                       sct = FALSE)
+  
+  obj$DoubletFinder = obj@meta.data %>%
+    select(starts_with("DF.")) %>%
+    pull()
+  
+  obj@meta.data = obj@meta.data %>%
+    rownames_to_column() %>%
+    select(-c(starts_with("DF."), starts_with("pANN"))) %>%
+    column_to_rownames()
+  
+  return(obj)
+}
+```
+
+## Reading data
+
+```{r}
+doublet_dir = "/Volumes/TOSHIBA/TIMElab/GSE182109_processed/scrublet/"
+data_dir = "/Volumes/TOSHIBA/TIMElab/GSE182109_RAW/"
+sample_ids = list.files(data_dir)
+sample_ids
+```
+Reading 10x data
+```{r,eval=F}
+read_10X_into_list <- function(file) {
+  doublets <- readLines(paste0(doublet_dir, file, ".txt"))
+  seurat_data <- Read10X(data.dir = paste(data_dir, file,sep="/"))
+  seurat_obj <- CreateSeuratObject(counts = seurat_data,
+                                   project = str_split(file, "_", Inf, T)[,1])
+  seurat_obj$scrublet.doublet <- doublets
+  #seurat_obj <- add_meta_seurat(seurat_obj)
+  return(seurat_obj)
+}
+
+obj_list = lapply(sample_ids, read_10X_into_list)
+```
+
+```{r}
+
+meta_list = lapply(obj_list, function(x) {
+  x@meta.data %>% rownames_to_column("cell")
+})
+
+meta = bind_rows(meta_list, .id = "id")
+
+meta = meta %>% unite("cell", c("cell", "id"), sep="_")
+```
+
+
+
+Saving the unedited object
+```{r,eval=F}
+saveRDS(obj_list, "E:/TIMElab/GSE182109_processed/obj_list.rds")
+```
+
+
+## Filtering
+
+I ran sclean on the obj_list. From the diagnostic images, samples #9 and #10 had too few cells in them.
+Removing those samples.
+```{r}
+obj_list_clean = lapply(obj_list_clean, function(x) {x[,x$qc_default==1]})
+
+# removing suspicious samples
+obj_list_clean[[9]] <- NULL
+obj_list_clean[[10]] <- NULL
+```
+
+```{r, eval=F}
+#obj_list = lapply(obj_list, detect_doublets)
+```
+
+I ended up not running DoubletFinder because the result looked odd - the "doublets" were distributed pretty much randomly over the embedding. Will have to find out what's the problem.
+
+```{r,eval=F}
+saveRDS(obj_list, "E:/TIMElab/GSE182109_processed/obj_list.rds")
+```
+
+rPCA Integration script was run on the samples.
+
+
+Reading the integrated object ...
+```{r}
+DefaultAssay(seurat_obj) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
+seurat_obj <- RunPCA(seurat_obj, npcs = 30, verbose = FALSE)
+seurat_obj <- RunUMAP(seurat_obj, reduction = "pca", dims = 1:30)
+seurat_obj <- FindNeighbors(seurat_obj, reduction = "pca", dims = 1:30)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.6)
+Idents(seurat_obj) <- "integrated_snn_res.0.6"
+```
+
+```{r}
+DimPlot(seurat_obj, label = T)
+```
+
+
+```{r}
+freq_df = seurat_obj@meta.data %>%
+  group_by(seq_folder,integrated_snn_res.0.6) %>%
+  summarise(Count = n()) %>%
+  mutate(Prop = Count/sum(Count))
+
+ggplot(data = seurat_obj@meta.data, aes(x = seq_folder, fill = integrated_snn_res.0.6)) + 
+  geom_histogram(colour = 'white', position = 'fill', stat = "count") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+```{r}
+freq_df = seurat_obj@meta.data %>%
+  group_by(integrated_snn_res.0.6, seq_folder) %>%
+  summarise(Count = n()) %>%
+  mutate(Prop = Count/sum(Count))
+
+ggplot(data = seurat_obj@meta.data, aes(x = integrated_snn_res.0.6, fill = seq_folder)) + 
+  geom_histogram(colour = 'white', position = 'fill', stat = "count") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+```{r}
+seurat_obj$lognUMI <- log2(seurat_obj$nUMI)
+VlnPlot(seurat_obj, pt.size = 0, "lognUMI") / VlnPlot(seurat_obj,  pt.size = 0,  "mitoRatio")
+```
+
+
+Removing GSM5518629 because it's mostlty cluster number 3 which I am also removing
+Clusters 17 and 19 is probably apoptotic
+```{r}
+seurat_obj = seurat_obj[,seurat_obj$seq_folder!="GSM5518629"]
+seurat_obj = seurat_obj[,seurat_obj$integrated_snn_res.0.6!=5]
+seurat_obj = seurat_obj[,seurat_obj$integrated_snn_res.0.6!=17]
+seurat_obj = seurat_obj[,seurat_obj$integrated_snn_res.0.6!=19]
+```
+
+### Cluster 11
+```{r}
+seurat_obj_sub = subset(seurat_obj, idents = 11)
+VlnPlot(seurat_obj_sub, pt.size = 0, "lognUMI") +
+  geom_hline(yintercept = 10.5)
+```
+```{r}
+cells_to_remove = colnames(seurat_obj_sub)[seurat_obj_sub$lognUMI<10.5]
+```
+
+
+### Cluster 7
+```{r}
+seurat_obj_sub = subset(seurat_obj, idents = 7)
+VlnPlot(seurat_obj_sub, pt.size = 0, "mitoRatio") +
+  geom_hline(yintercept = 0.025)
+```
+
+```{r}
+cells_to_remove = c(cells_to_remove, colnames(seurat_obj_sub)[seurat_obj_sub$mitoRatio<.025])
+```
+
+
+
+### Cluster 21
+```{r}
+seurat_obj_sub = subset(seurat_obj, idents = 21)
+VlnPlot(seurat_obj_sub, pt.size = 0, "lognUMI") +
+  geom_hline(yintercept = 11)
+```
+
+```{r}
+cells_to_remove = c(cells_to_remove, colnames(seurat_obj_sub)[seurat_obj_sub$lognUMI<11])
+```
+
+
+Cluster 22 looks strange but I will recluster and then check if its maps to a cell type
+
+### Cluster 23
+```{r}
+seurat_obj_sub = subset(seurat_obj, idents = 23)
+VlnPlot(seurat_obj_sub, pt.size = 0, "lognUMI") +
+  geom_hline(yintercept = 11)
+```
+
+```{r}
+cells_to_remove = c(cells_to_remove, colnames(seurat_obj_sub)[seurat_obj_sub$lognUMI<11])
+```
+
+Removing `r length(cells_to_remove)` cells
+
+```{r}
+seurat_obj = seurat_obj[,!colnames(seurat_obj) %in% cells_to_remove]
+```
+
+Reclustering
+```{r}
+# Run the standard workflow for visualization and clustering
+seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
+seurat_obj <- RunPCA(seurat_obj, npcs = 30, verbose = FALSE)
+seurat_obj <- RunUMAP(seurat_obj, reduction = "pca", dims = 1:30)
+seurat_obj <- FindNeighbors(seurat_obj, reduction = "pca", dims = 1:30)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.3)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.6)
+Idents(seurat_obj) <- "integrated_snn_res.0.3"
+```
+
+```{r}
+DimPlot(seurat_obj, label = T)
+```
+
+```{r}
+VlnPlot(seurat_obj, pt.size = 0, "lognUMI") / VlnPlot(seurat_obj,  pt.size = 0,  "mitoRatio")
+```
+
+```{r}
+freq_df = seurat_obj@meta.data %>%
+  group_by(integrated_snn_res.0.3, seq_folder) %>%
+  summarise(Count = n()) %>%
+  mutate(Prop = Count/sum(Count))
+
+ggplot(data = seurat_obj@meta.data, aes(x = integrated_snn_res.0.3, fill = seq_folder)) + 
+  geom_histogram(colour = 'white', position = 'fill', stat = "count") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+```{r}
+freq_df = seurat_obj@meta.data %>%
+  group_by(seq_folder,integrated_snn_res.0.3) %>%
+  summarise(Count = n()) %>%
+  mutate(Prop = Count/sum(Count))
+
+ggplot(data = seurat_obj@meta.data, aes(x = seq_folder, fill = integrated_snn_res.0.3)) + 
+  geom_histogram(colour = 'white', position = 'fill', stat = "count") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+Removing cluster 10
+Removing cluster 16 because 50 perc of cells map to only one sample
+Filtering lower UMI distributon of 3rd cluster
+
+```{r}
+seurat_obj = seurat_obj[,seurat_obj$integrated_snn_res.0.3!=10]
+seurat_obj = seurat_obj[,seurat_obj$integrated_snn_res.0.3!=16]
+```
+
+### Cluster 3
+```{r}
+seurat_obj_sub = subset(seurat_obj, idents = 3)
+VlnPlot(seurat_obj_sub, pt.size = 0, "lognUMI") +
+  geom_hline(yintercept = 10.75)
+```
+
+```{r}
+cells_to_remove = colnames(seurat_obj_sub)[seurat_obj_sub$lognUMI<10.75]
+length(cells_to_remove)
+seurat_obj = seurat_obj[,!colnames(seurat_obj) %in% cells_to_remove]
+```
+
+```{r}
+# Run the standard workflow for visualization and clustering
+seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
+seurat_obj <- RunPCA(seurat_obj, npcs = 30, verbose = FALSE)
+seurat_obj <- RunUMAP(seurat_obj, reduction = "pca", dims = 1:12)
+seurat_obj <- FindNeighbors(seurat_obj, reduction = "pca", dims = 1:12)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.3)
+Idents(seurat_obj) <- "integrated_snn_res.0.3"
+```
+```{r}
+DimPlot(seurat_obj, label = T)
+```
+```{r}
+VlnPlot(seurat_obj, pt.size = 0, "lognUMI") / VlnPlot(seurat_obj,  pt.size = 0,  "mitoRatio")
+```
+
+
+```{r}
+seurat_obj = seurat_obj[,seurat_obj$integrated_snn_res.0.3!=11]
+```
+
+Re-integrating the object ...
+
+```{r}
+DimPlot(seurat_obj, label = T, group.by = "integrated_snn_res.0.2")
+```
+
+```{r}
+freq_df = seurat_obj@meta.data %>%
+  group_by(integrated_snn_res.0.2, seq_folder) %>%
+  summarise(Count = n()) %>%
+  mutate(Prop = Count/sum(Count))
+
+ggplot(data = seurat_obj@meta.data, aes(x = integrated_snn_res.0.2, fill = seq_folder)) + 
+  geom_histogram(colour = 'white', position = 'fill', stat = "count") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+
+
+```{r}
+saveRDS(seurat_obj, "E:/TIMElab/GSE182109_processed/seurat_integrated_filtered.rds")
+```
+
+```{r}
+seurat_obj = readRDS("H:/TIMElab/GSE182109_processed/seurat_integrated_filtered.rds")
+```
+
+
+
+
+Let's try running DoubletFinder
+```{r,eval=F}
+DefaultAssay(seurat_obj) = "RNA"
+seurat_obj_list = SplitObject(seurat_obj, split.by = "seq_folder")
+seurat_obj_list_test = lapply(seurat_obj_list[1:7], detect_doublets)
+```
+
+```{r,eval=F}
+p1 = DimPlot(seurat_obj_list_test[[1]], group.by = "DoubletFinder")
+p2 = DimPlot(seurat_obj_list_test[[2]], group.by = "DoubletFinder")
+p3 = DimPlot(seurat_obj_list_test[[3]], group.by = "DoubletFinder")
+p4 = DimPlot(seurat_obj_list_test[[4]], group.by = "DoubletFinder")
+p5 = DimPlot(seurat_obj_list_test[[5]], group.by = "DoubletFinder")
+p6 = DimPlot(seurat_obj_list_test[[6]], group.by = "DoubletFinder")
+p1 + p2 + p3 + p4 + p5 + p6
+```
+
+
+
+## Annotation
+
+```{r}
+DefaultAssay(seurat_obj) <- "RNA"
+seurat_obj = NormalizeData(seurat_obj)
+seurat_obj = ScaleData(seurat_obj)
+p = DotPlot(seurat_obj,
+        features = c("PDGFRA", "SOX2", "OLIG1", "NES", "GFAP", "S100B", "EGFR", "MBP", "PDGFRB", "ACTA2", "PROM1", "PECAM1", "TEK", "P2RY12", "PTPRC", "ITGAM", "ITGAX", "S100A8", "CD68", "MRC1", "NKG7", "CD3E", "CD8A", "CD4", "CD79A", "MKI67"),
+        cluster.idents = T) +
+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+p
+```
+```{r}
+ggsave(p, path="H:/TIMElab/figures", filename= "markers_all.pdf", width=8.5, height=3, dpi=700)
+```
+
+
+```{r}
+Idents(seurat_obj) <- "integrated_snn_res.0.2"
+seurat_obj <- RenameIdents(object = seurat_obj, 
+                              "0" = "Myeloid",
+                              "1" = "Myeloid",
+                              "2" = "Glioma",
+                              "3" = "Glioma",
+                              "4" = "T cell",
+                              "5" = "Glioma",
+                              "6" = "Glioma",
+                              "7" = "Myeloid",
+                              "8" = "Glioma",
+                              "9" = "Myeloid",
+                              "10" = "Oligo",
+                           "11" = "Pericyte",
+                           "12" = "B cell",
+                           "13" = "Endothelial",
+                           "14" = "T cell")
+seurat_obj$cell.type = Idents(seurat_obj)
+
+p = DimPlot(seurat_obj, label = TRUE, group.by = "cell.type")
+p
+```
+
+```{r,eval=F}
+saveRDS(seurat_obj, "H:/TIMElab/GSE182109_processed/seurat_integrated_filtered.rds")
+```
+
+                                                      

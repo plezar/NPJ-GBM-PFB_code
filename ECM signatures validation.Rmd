@@ -1,0 +1,197 @@
+---
+title: "ECM signatures validation"
+output: html_document
+date: "2023-08-11"
+---
+
+```{r}
+library(tidyverse)
+library(NMF)
+library(pdfCluster)
+library(SummarizedExperiment)
+```
+
+
+```{r}
+se = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA-CGGA-SummarizedExperiment.rds")
+matrisome_geneset = readLines("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/matrisome_geneset.txt")
+nmf_res = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/nmf.k2.rds")
+```
+
+```{r}
+varfilt_mat = assay(se, 2)[apply(assay(se, 2), 1, mad) > .5,]
+varfilt_ctrd_mat = sweep(varfilt_mat,1, apply(varfilt_mat,1,mean,na.rm=T))
+varfilt_ctrd_nonneg_mat = varfilt_ctrd_mat-min(varfilt_ctrd_mat)
+varfilt_ctrd_nonneg_ecm_mat = varfilt_ctrd_nonneg_mat[rownames(varfilt_ctrd_nonneg_mat)%in%matrisome_geneset,]
+```
+
+
+Bootstrap
+```{r}
+adj.rand.index_v = c()
+iter_n = 50
+nmf_n_run = 50
+
+for (i in 1:iter_n) {
+  #boot_y = sample(1:nrow(varfilt_ctrd_nonneg_ecm_mat), replace = T)
+  #nmf_boot_res = nmf(varfilt_ctrd_nonneg_ecm_mat[boot_y,], 2, nrun=nmf_n_run, .pbackend = "par")
+  #saveRDS(nmf_boot_res, file = paste0("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/NMF_bootstrap/", "nmf.boot.k2.", i, ".rds"))
+  nmf_boot_res = readRDS(paste0("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/NMF_bootstrap/", "nmf.boot.k2.", i, ".rds"))
+  adj.rand.index_v = c(adj.rand.index_v, adj.rand.index(predict(nmf_res), predict(nmf_boot_res)))
+}
+
+saveRDS(adj.rand.index_v, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/NMF_bootstrap/adj.rand.index_v.rds")
+```
+
+
+Re-run NMF on the same data
+```{r}
+adj.rand.index_v = c()
+iter_n = 50
+nmf_n_run = 50
+
+for (i in 1:25) {
+  #nmf_boot_res = nmf(varfilt_ctrd_nonneg_ecm_mat, 2, nrun=nmf_n_run, .pbackend = "par")
+  #saveRDS(nmf_boot_res, file = paste0("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/NMF_rerun/", "nmf.boot.k2.", i, ".rds"))
+  nmf_boot_res = readRDS(paste0("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/NMF_rerun/", "nmf.boot.k2.", i, ".rds"))
+  adj.rand.index_v = c(adj.rand.index_v, adj.rand.index(predict(nmf_res), predict(nmf_boot_res)))
+}
+
+saveRDS(adj.rand.index_v, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/NMF_rerun/adj.rand.index_v.rds")
+```
+
+
+```{r}
+generate_ctrl_geneset = function(geneset, binmat, n_breaks) {
+  
+  ctrl_geneset = c()
+  
+  # Aggregate expression level
+  Ea = rowMeans(binmat)
+  Ea_binned = cut(Ea, breaks = n_breaks)
+  
+  for (i in 1:length(geneset)) {
+    gene_i = geneset[i]
+    bin_i = Ea_binned[which(rownames(binmat) %in% gene_i)]
+    genes_bin_i = rownames(binmat)[Ea_binned %in% bin_i]
+    genes_bin_i = setdiff(genes_bin_i, gene_i)
+    ctrl_geneset = c(ctrl_geneset, sample(genes_bin_i, 1))
+  }
+  
+  ctrl_geneset
+}
+```
+
+Testing the function
+```{r}
+ctrl_geneset = generate_ctrl_geneset(geneset = rownames(varfilt_ctrd_nonneg_ecm_mat),
+                      binmat = varfilt_mat,
+                      n_breaks = 30)
+hist(varfilt_mat[rownames(varfilt_ctrd_nonneg_ecm_mat),])
+hist(varfilt_mat[ctrl_geneset,])
+```
+
+
+NMF on ref. geneset
+```{r}
+adj.rand.index_v = c()
+iter_n = 50
+nmf_n_run = 50
+
+for (i in 1:iter_n) {
+  #ref_y = generate_ctrl_geneset(geneset = rownames(varfilt_ctrd_nonneg_ecm_mat), binmat = varfilt_mat, n_breaks = 30)
+  #nmf_boot_res = nmf(varfilt_ctrd_nonneg_mat[ref_y,], 2, nrun=nmf_n_run, .pbackend = "par")
+  #saveRDS(nmf_boot_res, file = paste0("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/NMF_refgeneset/", "nmf.refgset.k2.", i, ".rds"))
+  nmf_boot_res = readRDS(paste0("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/NMF_refgeneset/", "nmf.refgset.k2.", i, ".rds"))
+  adj.rand.index_v = c(adj.rand.index_v, adj.rand.index(predict(nmf_res), predict(nmf_boot_res)))
+}
+
+saveRDS(adj.rand.index_v, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/NMF_refgeneset/adj.rand.index_v.rds")
+```
+
+
+
+```{r}
+adj.rand.index_v_boot = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/NMF_bootstrap/adj.rand.index_v.rds")
+adj.rand.index_v_refgset = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/NMF_refgeneset/adj.rand.index_v.rds")
+adj.rand.index_v_rerun = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/NMF_rerun/adj.rand.index_v.rds")
+
+```
+
+```{r}
+library(ggpubr)
+library(rstatix)
+library(cowplot)
+
+ari_stats_df = rbind(
+  data.frame(ARI = adj.rand.index_v_boot, Group = "Bootstrap"),
+  data.frame(ARI = adj.rand.index_v_refgset, Group = "Reference geneset")
+  #data.frame(ARI = adj.rand.index_v_rerun, Group = "Core matrisome")
+)
+
+ari_stats_df$Group = factor(ari_stats_df$Group, levels = c("Bootstrap", "Reference geneset"))
+
+stat.test <- ari_stats_df %>%
+  t_test(ARI ~ Group) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "Group") %>%
+  mutate(y.position = y.position)
+
+p = ggviolin(ari_stats_df,
+          x = "Group",
+          y = "ARI",
+          add = c("boxplot", "jitter"),
+          color = "Group",
+          #palette = palette_ECM_subtype,
+          outlier.shape = NA,
+          width = 0.6) +
+  stat_pvalue_manual(stat.test, label = "p.adj.signif") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="Adjusted Rand Index", x = NULL) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1), legend.position = "none")
+
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.3
+p
+```
+
+```{r, eval=F}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG1/Supplement/"
+ggsave(p, path=fig_path, filename= "NMF_bootstrap_ARI.pdf", width=2.5*.95, height=4*.95, dpi = 700)
+```
+
+
+
+
+
+
+
+
+Bootstrap on core samples
+```{r}
+adj.rand.index_v = c()
+iter_n = 50
+nmf_n_run = 50
+
+for (i in 1:iter_n) {
+  boot_y = sample(1:nrow(varfilt_ctrd_nonneg_ecm_mat), replace = T)
+  nmf_boot_res = nmf(varfilt_ctrd_nonneg_ecm_mat[boot_y, colData(se)$Core.sample], 2, nrun=nmf_n_run, .pbackend = "par")
+  saveRDS(nmf_boot_res, file = paste0("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/NMF_bootstrap/", "nmf.boot.k2.core.", i, ".rds"))
+  #nmf_boot_res = readRDS(paste0("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/NMF_bootstrap/", "nmf.boot.k2.", i, ".rds"))
+  adj.rand.index_v = c(adj.rand.index_v, adj.rand.index(predict(nmf_res)[colData(se)$Core.sample], predict(nmf_boot_res)))
+}
+
+saveRDS(adj.rand.index_v, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/NMF_bootstrap/adj.rand.index_v.core.rds")
+```
+
+
+
+
+
+
+
+
+

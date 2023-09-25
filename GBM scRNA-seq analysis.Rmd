@@ -1,0 +1,5109 @@
+---
+title: "GBM scRNA-seq"
+author: "Maksym"
+date: "7/28/2022"
+output: html_document
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(RColorBrewer)
+library(corrplot)
+library(ComplexHeatmap)
+library(readr)
+library(ggpubr)
+library(circlize)
+library(NMF)
+library(rstatix)
+library(cowplot)
+#devtools::install_github("jlaffy/scalop")
+#library(scalop)
+fig_path = "F:/TIMElab/figures/"
+source("../max/util.R")
+```
+
+```{r}
+seurat_obj = readRDS("F:/TIMElab/GSE182109_processed/integrated_filtered_seurat_object.rds")
+```
+
+
+
+
+
+
+```{r,eval=F}
+saveRDS(seurat_obj, "F:/TIMElab/GSE182109_processed/integrated_seurat_object_anno.rds")
+```
+
+
+
+_________________
+Reading the result
+
+```{r}
+scores = readRDS("F:/TIMElab/GSE182109_processed/sig_scores.rds")
+scores
+```
+
+```{r}
+seurat_obj@meta.data = seurat_obj@meta.data %>%
+  rownames_to_column() %>%
+  left_join(
+    scores %>% rownames_to_column()
+  ) %>%
+  column_to_rownames()
+```
+
+Hybrid subtypes
+```{r}
+data = seurat_obj@meta.data[,c("MES1", "MES2", "AC", "OPC", "NPC1", "NPC2")]
+
+assign_hybrid_states <- function(sig_data) {
+  
+  if (all(is.na(sig_data))) {
+    return(NA)
+  } else {
+    scores = sort(sig_data, decreasing = T)
+    c2_data = data[,names(scores[2])]
+    c2_data = c2_data[!is.na(c2_data)]
+    
+    c1 = scores[2]>1
+    c2 = mean(scores[2]>c2_data)>.1
+    c3 = (scores[2]-scores[3])>.3
+    
+    if (c1&c2&c3) {
+      hybrid_name = paste(sort(c(names(scores[1]), names(scores[2]))), collapse = "/")
+      return(hybrid_name)
+    } else {
+      return(names(scores[1]))
+    }
+  }
+}
+
+seurat_obj$neftel.subtype = apply(t(data), 2, assign_hybrid_states)
+seurat_obj$neftel.subtype.pure = ifelse(grepl("/", seurat_obj$neftel.subtype), NA, seurat_obj$neftel.subtype)
+Idents(seurat_obj) = "neftel.subtype.pure"
+```
+
+```{r}
+p1 = DimPlot(seurat_obj, group.by = "neftel.subtype.pure")
+p2 = DimPlot(seurat_obj, group.by = "neftel.subtype")
+p1
+p2
+```
+
+### Cell state frequency
+
+```{r, eval=F}
+library(ggpubr)
+library(rstatix)
+library(cowplot)
+library(tidyverse)
+
+freq_d = seurat_obj@meta.data %>%
+  filter(ECM.cluster == "ECMlo" | ECM.cluster == "ECMhi") %>%
+  group_by(seq_folder, ECM.cluster, cell.type) %>%
+  summarise(Count = n()) %>%
+  mutate(Prop = Count/sum(Count))
+
+stat.test <- freq_d %>%
+  group_by(cell.type) %>%
+  t_test(Prop ~ ECM.cluster) %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(p.adj = signif(p.adj, 3), y.position = y.position + .2)
+
+
+p = ggviolin(freq_d,
+          x = "ECM.cluster",
+          y = "Prop",
+          add = c("boxplot", "jitter"),
+          color = "ECM.cluster",
+          palette = palette_ECM_subtype,
+          #facet.by = "Cluster",
+          outlier.shape = NA,
+          width = 0.6) +
+  #geom_dotplot(aes(fill = Cluster, color = Cluster), binaxis='y', stackdir='center', dotsize=.4) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="Frequency") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(legend.position = "none") +
+  ylim(0, 1.5) +
+  xlab(NULL)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.5
+p = facet(p, "cell.type", nrow = 1)
+p
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures", filename= "neftel_states_violin.pdf", width=6.2, height=3, dpi=700)
+```
+
+
+### MiloR
+
+Prepare the data and the env
+```{r}
+library(miloR)
+library(SingleCellExperiment)
+library(scater)
+library(dplyr)
+library(Seurat)
+library(patchwork)
+
+seurat_sce <- as.SingleCellExperiment(seurat_obj[,seurat_obj$ECM.cluster!="undefined"])
+seurat_sce <- swapAltExp(seurat_sce, "integrated")
+seurat_milo <- Milo(seurat_sce)
+reducedDim(seurat_milo, "UMAP") <- reducedDim(seurat_sce, "UMAP")
+rm(seurat_sce)
+```
+
+```{r}
+seurat_milo <- buildGraph(seurat_milo, k = 24, d = 30)
+seurat_milo <- makeNhoods(seurat_milo, prop = .1, k = 24, d=30, refined = TRUE)
+plotNhoodSizeHist(seurat_milo)
+```
+
+
+Counting cells in neighborhoods
+```{r}
+seurat_milo <- countCells(seurat_milo, meta.data = data.frame(colData(seurat_milo)), sample="seq_folder")
+```
+
+DA testing
+```{r}
+traj_design <- data.frame(colData(seurat_milo))[,c("seq_folder", "ECM.cluster")]
+traj_design <- distinct(traj_design)
+rownames(traj_design) <- traj_design$seq_folder
+traj_design$ECM.cluster <- factor(traj_design$ECM.cluster)
+traj_design$ECM.cluster <- relevel(traj_design$ECM.cluster, "ECMlo")
+```
+
+Cydar package introduces spatial FDR correction which accounts for overlaps between neighborhoods. It was initially developed for mass cytometry data. It weights each hypothesis P-value by the reciprocal (1/x) of the kth nearest neighbor distance.
+```{r}
+da_results_1 <- testNhoods(seurat_milo, design = ~ ECM.cluster, design.df = traj_design, fdr.weighting="graph-overlap")
+da_results_1 %>%
+  filter(FDR < 0.05)
+```
+
+```{r}
+library(scales)
+seurat_milo <- buildNhoodGraph(seurat_milo)
+col <- scale_fill_gradient2(low = muted("blue"),
+                            mid = "white",
+                            high = muted("red"),
+                            midpoint = 0)
+p1 <- plotNhoodGraphDA(seurat_milo, da_results_1, alpha=0.05) + col + labs(fill = "logFC")
+```
+
+```{r, eval=F}
+ggsave(p1, path="F:/TIMElabfigures/FIG2", filename= "miloR_ECM.cluster.pdf", width=8.5, height=7, dpi=700)
+```
+
+```{r, eval=F}
+p = DimPlot(seurat_obj_sub, label = T)
+ggsave(p, path="F:/TIMElabGSE182109_processed/milor/tcells", filename= "umap.pdf", width=8.5, height=7, dpi=700)
+```
+
+
+### UMAP plot
+
+```{r}
+col_celltype <- RColorBrewer::brewer.pal(7, "Paired")
+names(col_celltype) = c("T cell", "Myeloid", "Oligo", "B cell",  "Pericyte", "Endothelial", "Glioma")
+```
+
+
+```{r}
+p = DimPlot(seurat_obj, label = TRUE, group.by = "cell.type", repel = T, label.size = 5, raster.dpi =  c(512*2, 512*2))
+p
+```
+
+```{r}
+ggsave(p, path="C:/Users/mzarodn2/Documents/TIME-Lab/maks_omics/output", filename= "umap_cell.type.pdf", width=6.2, height=5, dpi=700)
+```
+
+
+```{r}
+umap_plot <- DimPlot(seurat_obj,
+        label = F,
+        label.size = 5,
+        cols = col_celltype) +
+  #theme(legend.position = "none") +
+  labs(subtitle = NULL)
+```
+
+```{r}
+ggsave(umap_plot, path="F:/TIMElab/figures", filename= "umap_all.pdf", width=7.2, height=6, dpi=700)
+```
+
+
+
+```{r}
+p = DimPlot(seurat_obj,
+        label = F,
+        split.by = "tumor",
+        ncol = 1,
+        label.size = 5,
+        cols = col_celltype) +
+  theme(legend.position = "none")
+```
+```{r}
+ggsave(p, path="F:/TIMElab/figures/", filename= "umap_all_by_tumor.pdf", width=2.5, height=6, dpi=700)
+```
+
+
+### Scoring
+
+```{r}
+sigs = readRDS("C:/Users/mzarodn2/Documents/TIME-Lab/maks_omics/output/ECM_gene_signatures.rds")
+```
+
+
+```{r}
+sig_scores = scrabble::score(
+  mat = as.matrix(seurat_obj@assays$RNA@data),
+  groups = sigs
+)
+
+seurat_obj$ECMhi.sigscore <- sig_scores[,"ECMhi"]
+seurat_obj$ECMlo.sigscore <- sig_scores[,"ECMlo"]
+```
+```{r}
+library(ggpubr)
+d = seurat_obj@meta.data %>%
+  select(cell.type, ECMhi.sigscore)
+
+
+p = ggviolin(d,
+          x = "cell.type",
+          y = "ECMhi.sigscore",
+          add = c("boxplot"),
+          color = "cell.type",
+          outlier.shape = NA,
+          width = 0.6) +
+  theme_cowplot(15) +
+  labs(y="Signature score") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(legend.position = "none") +
+  xlab(NULL)
+```
+
+
+
+
+
+```{r}
+ggsave(p, path="C:/Users/mzarodn2/Documents/TIME-Lab/maks_omics/output", filename= "ECMhi_score_celltype.pdf", width=4.5, height=3, dpi=700)
+```
+
+
+
+```{r}
+p = FeaturePlot(seurat_obj, "ECMhi.sigscore", order = T)
+```
+```{r}
+ggsave(p, path="F:/TIMElabfigures/FIG2", filename= "ECMhi_score_celltype_FeaturePlot.pdf", width=6.2, height=5, dpi=700)
+```
+
+
+
+### ECM signatures
+
+
+
+```{r}
+gene_set.df = readxl::read_xlsx("F:/TIMElab/bulk_RNAseq/matrisome_hs_masterlist.xlsx")
+gene_set = gene_set.df %>% filter(Division=="Core matrisome") %>% pull(`Gene Symbol`)
+```
+
+```{r}
+Idents(seurat_obj) = "cell.type"
+seurat_obj_glioma = subset(seurat_obj, idents = "Glioma")
+unique(seurat_obj_glioma$seq_folder)
+```
+Subsetting genes and filtering based on expression
+```{r}
+seurat_obj_glioma = seurat_obj_glioma[rownames(seurat_obj_glioma)%in%gene_set,]
+seurat_obj_glioma = seurat_obj_glioma[rowSums(seurat_obj_glioma@assays$RNA@counts) > ncol(seurat_obj_glioma)*.1,]
+```
+
+Let's try doing that on one sample
+```{r}
+seurat_obj_glioma_sub = seurat_obj_glioma[,seurat_obj_glioma$seq_folder=="GSM5518620"]
+DimPlot(seurat_obj_glioma_sub)
+```
+
+```{r}
+seurat_obj_glioma_sub = ScaleData(seurat_obj_glioma_sub)
+DoHeatmap(seurat_obj_glioma_sub, features = gene_set[gene_set%in%rownames(seurat_obj_glioma_sub)])
+```
+```{r}
+mat = as.matrix(seurat_obj_glioma_sub@assays$RNA@data)+0.001
+```
+
+```{r,eval=F}
+nmf_res = nmf(mat, 2:6, nrun=50, seed=42, .pbackend = "par")
+saveRDS(nmf_res, "F:/TIMElab/GSE182109_processed/nmf/GSM5518620_nmf.optim.rds")
+```
+
+```{r}
+nmf_res = readRDS("F:/TIMElab/GSE182109_processed/nmf/GSM5518620_nmf.optim.rds")
+plot(nmf_res)
+```
+
+```{r, eval=F}
+nmf_res = nmf(mat, 4, nrun=50, seed=42, .pbackend = "par")
+saveRDS(nmf_res, "F:/TIMElab/GSE182109_processed/nmf/GSM5518620.k4.rds")
+```
+
+```{r}
+nmf_res = readRDS("F:/TIMElab/GSE182109_processed/nmf/GSM5518620.k4.rds")
+seurat_obj_glioma_sub$cluster = predict(nmf_res)
+DoHeatmap(seurat_obj_glioma_sub, features = gene_set[gene_set%in%rownames(seurat_obj_glioma_sub)], group.by = "cluster")
+```
+
+```{r}
+table(seurat_obj_glioma_sub$cluster, seurat_obj_glioma_sub$neftel.subtype.pure)
+```
+
+```{r}
+gene_set[gene_set%in%rownames(seurat_obj_glioma_sub)]
+```
+
+### Consensus clustering
+
+```{r}
+consensus_hclust = ConsensusClusterPlus(mat,
+                                        maxK = 10,
+                                        seed=42)
+```
+
+
+
+
+
+
+
+
+### Pseudobulk samples
+
+```{r}
+library(scuttle)
+library(edgeR)
+
+DefaultAssay(seurat_obj) <- "RNA"
+
+merged_sce <- as.SingleCellExperiment(DietSeurat(seurat_obj))
+merged_sce@assays@data$logcounts <- NULL
+summed <- aggregateAcrossCells(merged_sce, 
+                               id=colData(merged_sce)[,c("seq_folder", "tumor")],
+                               use.assay.type = 1)
+
+
+```
+
+```{r}
+y <- DGEList(counts(summed), samples=colData(summed))
+```
+
+```{r}
+keep <- filterByExpr(y)
+table(keep)
+
+y <- y[keep,]
+summary(keep)
+
+y <- calcNormFactors(y)
+?edgeR::calcNormFactors
+y$samples
+```
+
+```{r}
+plotMDS(cpm(y, log=TRUE))
+```
+
+```{r}
+y$log2cpm = cpm(y, log=TRUE)
+```
+
+```{r}
+saveRDS(y, "F:/TIMElab/GSE182109_processed/scrnaseq_psedobulk.rds")
+```
+
+
+
+### ECM bulk subtypes
+
+Reading pseudobulk data
+```{r}
+seurat_obj = readRDS("F:/TIMElab/GSE182109_processed/seurat_obj.rds")
+pseudobulk_data = readRDS("F:/TIMElab/GSE182109_processed/scrnaseq_psedobulk.rds")
+
+selection = pseudobulk_data$samples$tumor!="LGG"
+pseudobulk_data = pseudobulk_data[,selection]
+pseudobulk_data$cpm = pseudobulk_data$cpm[,selection]
+```
+
+Reading signatures
+```{r}
+sigs = readRDS("F:/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+```
+
+Scoring samples
+```{r}
+library(scrabble)
+
+sigs$ECMhi = sigs$ECMhi[sigs$ECMhi%in%rownames(pseudobulk_data)]
+sigs$ECMlo = sigs$ECMlo[sigs$ECMlo%in%rownames(pseudobulk_data)]
+
+sig_scores = scrabble::score(
+  mat = pseudobulk_data$cpm,
+  groups = sigs
+)
+
+Heatmap(t(sig_scores))
+```
+
+```{r}
+score_threshold = 0
+
+pseudobulk_data$samples$ECM.cluster = sig_scores %>%
+  as.data.frame() %>%
+  mutate(ECM.cluster = if_else(ECMhi > score_threshold & ECMlo < -(score_threshold), "ECMhi",
+                               if_else(ECMhi < (-score_threshold) & ECMlo > score_threshold, "ECMlo", "undefined"))) %>%
+  pull(ECM.cluster)
+
+Heatmap(t(sig_scores),
+        column_split = factor(pseudobulk_data$samples$ECM.cluster))
+```
+
+
+
+
+```{r}
+mat = pseudobulk_data$cpm[rownames(pseudobulk_data$cpm) %in% unlist(sigs),]
+mat = t(scale(t(mat)))
+
+ha = HeatmapAnnotation(
+  #"nd/r" = pseudobulk_data$samples$tumor[selection],
+  #"Region" = pseudobulk_data$samples$region[selection],
+  "COL1hi sig" = sig_scores[,1],
+  "COL1lo sig" = sig_scores[,2],
+  col = list("nd/r" = c("ndGBM" = "#91D1C2B2", "rGBM" = "#DC0000B2"),
+             "COL1hi sig" = colorRamp2(c(-3, 0, 3), c("blue", "white", "red")),
+             "COL1lo sig" = colorRamp2(c(-3, 0, 3), c("blue", "white", "red"))),
+  show_legend = T,
+  simple_anno_size = unit(.3, "cm")
+)
+
+row_split_vec = c()
+row_split_vec[rownames(mat)%in%sigs$ECMhi] = "ECMhi"
+row_split_vec[rownames(mat)%in%sigs$ECMlo] = "ECMlo"
+
+km.res = kmeans(t(mat), 3, nstart = 25)
+
+dim(pseudobulk_data$cpm)
+
+ht = Heatmap(
+  mat,
+ col = colorRamp2(seq(-3, 3, length.out=11), rev(brewer.pal(n=11, name="RdBu"))),
+  name = "Scaled expr",
+  row_split = factor(row_split_vec),
+  show_row_names = T,
+  show_row_dend = F,
+  show_column_names = F,
+  row_names_gp = gpar(fontsize = 4),
+  column_names_gp = gpar(fontsize = 8),
+  width = unit(7.5, "cm"),
+  height = unit(10.5, "cm"),
+  top_annotation = ha,
+  #right_annotation = ra,
+   column_split = factor(pseudobulk_data$samples$ECM.cluster),
+  cluster_columns = T,
+  show_column_dend = T
+)
+
+ht
+```
+
+
+```{r}
+pdf(paste0(fig_path, "scrnaseq_ecm_signature_heatmap.pdf"), width = 10, height = 7)
+draw(ht)
+dev.off()
+```
+
+
+
+
+
+Undefined samples seem to have fewer cells which means that pseudobulk averages are less reliable
+
+```{r}
+library(rstatix)
+library(ggpubr)
+library(cowplot)
+
+n_cells = seurat_obj@meta.data %>%
+  group_by(seq_folder, ECM.cluster) %>%
+  summarise(Count = n()) %>%
+  ungroup() %>% drop_na()
+
+stat.test <- n_cells %>%
+  t_test(Count ~ ECM.cluster) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(y.position = y.position+3e3) %>%
+  arrange(p.adj)
+
+n_cells$ECM.cluster = factor(n_cells$ECM.cluster, levels=c("ECMhi", "ECMlo", "undefined"))
+
+p = ggviolin(n_cells,
+          x = "ECM.cluster",
+          y = "Count",
+          add = c("boxplot", "jitter"),
+          color = "ECM.cluster",
+          palette = palette_ECM_subtype,
+          outlier.shape = NA,
+          width = 0.6) +
+  stat_pvalue_manual(stat.test, label = "p.adj.signif") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="Cell number") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(legend.position = "none") +
+  xlab(NULL)
+
+
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .5
+#p$layers[[idx]]$aes_params$alpha <- 0.5
+p
+```
+```{r}
+ggsave(p, path="F:/TIMElab/figures", filename= "scsrnaseq_ECM_classification_cell_numbers.pdf", width=3, height=3, dpi=700)
+```
+
+
+
+
+
+```{r}
+saveRDS(seurat_obj, "F:/TIMElab/GSE182109_processed/seurat_obj.rds")
+```
+
+
+
+
+Plotting signature gene expression
+
+```{r}
+#seurat_obj_sub = seurat_obj[,seurat_obj$ECM.cluster!="undefined"]
+palette_ECM_subtype = c("ECMhi" = "#E64B35FF", "ECMlo" = "#4DBBD5FF")
+
+DotPlot(seurat_obj_sub,
+        split.by = "ECM.cluster",
+        features = sigs$ECMhi,  cols = c("#4DBBD5FF", "#E64B35FF")) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+DotPlot(seurat_obj_sub,
+        split.by = "ECM.cluster",
+        features = sigs$ECMlo,  cols = c("#4DBBD5FF", "#E64B35FF")) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+### ECMhi marker expression
+
+```{r}
+sigs = readRDS("F:/TIMElabbulk_RNAseq/ECM_gene_signatures.rds")
+```
+
+
+```{r}
+p = DotPlot(seurat_obj, features = sigs$ECMhi, group.by = "cell.type.fine", cluster.idents = T) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + coord_flip()
+```
+
+```{r}
+ggsave(p, path="F:/TIMElabfigures/FIG2", filename= "ECMhi_marker_expr.pdf", width=9, height=11, dpi=700)
+```
+
+
+
+
+
+### edgeR
+
+```{r}
+library(scran)
+library(scuttle)
+library(edgeR)
+library(Seurat)
+library(tidyverse)
+
+load_gene_annotations <- function() {
+  library("AnnotationHub")
+  # Connect to AnnotationHub
+  ah <- AnnotationHub()
+  
+  # Access the Ensembl database for organism
+  ahDb <- query(ah, 
+                pattern = c("Homo sapiens", "EnsDb"), 
+                ignore.case = TRUE)
+  
+  # Acquire the latest annotation files
+  id <- ahDb %>%
+    mcols() %>%
+    rownames() %>%
+    tail(n = 1)
+  
+  # Download the appropriate Ensembldb database
+  edb <- ah[[id]]
+  
+  # Extract gene-level information from database
+  annotations <- genes(edb, 
+                       return.type = "data.frame")
+  
+  # Select annotations of interest
+  annotations <- annotations %>%
+    dplyr::select(gene_id, gene_name, seq_name, gene_biotype, description)
+  
+  return(annotations)
+}
+```
+
+```{r}
+annotations <- load_gene_annotations()
+```
+
+
+```{r}
+seurat_obj_sub = seurat_obj[,seurat_obj$ECM.cluster!="undefined"]
+seurat_obj_sub = seurat_obj_sub[,!is.na(seurat_obj_sub$ECM.cluster)]
+
+# Only three samples
+#samples_to_analyze = c("GSM5518600", "GSM5518601", "GSM5518602", "GSM5518608", "GSM5518609", "GSM5518610")
+#seurat_obj_sub = seurat_obj_sub[,seurat_obj_sub$seq_folder %in% samples_to_analyze]
+
+DimPlot(seurat_obj_sub, label= T)
+```
+
+```{r}
+do_pseudobulk <- function(seurat_object) {
+
+  #de.results <- do_pseudobulk(merged_seurat)
+  
+  DefaultAssay(seurat_object) <- "RNA"
+  merged_sce <- as.SingleCellExperiment(DietSeurat(seurat_object))
+  merged_sce@assays@data$logcounts <- NULL
+  summed <- aggregateAcrossCells(merged_sce, 
+                                 id=colData(merged_sce)[,c("cell.type", "seq_folder")],
+                                 use.assay.type = 1)
+  summed.filt <- summed[,summed$ncells >= 10]
+  de.results <- pseudoBulkDGE(summed.filt, 
+                              label=summed.filt$cell.type,
+                              design=~factor(ECM.cluster),
+                              coef="factor(ECM.cluster)ECMlo",
+                              condition=summed.filt$ECM.cluster)
+  return(de.results)
+}
+
+write_de_results <- function(pseudobulk_out) {
+  # Formats the output as a nice table
+  #to_write <- write_de_results(de.results)
+  merged_df = data.frame()
+  for (i in names(pseudobulk_out)) {
+    merged_df_sub <- as.data.frame(pseudobulk_out[[i]]) %>%
+      #dplyr::filter(FDR < 0.05) %>%
+      mutate(Cell.type = i) %>%
+      arrange(FDR) %>%
+      drop_na() %>%
+      rownames_to_column("Gene.name")
+    
+    merged_df <- rbind(merged_df, merged_df_sub)
+  }
+  merged_df <- merged_df  %>%
+    left_join(y = unique(annotations[, c("gene_name", "description")]),
+              by = c("Gene.name" = "gene_name"))
+  return(merged_df)
+}
+
+find_specific_DE <- function(cluster_name) {
+  # Finds genes that are DE in a specific cluster but not others
+  
+  is.de <- decideTestsPerLabel(de.results, threshold=0.05)
+  
+  # Finding all genes that are not remotely DE in all other labels.
+  remotely.de <- decideTestsPerLabel(de.results, threshold=0.5)
+  not.de <- remotely.de==0 | is.na(remotely.de)
+  not.de.other <- rowMeans(not.de[,colnames(not.de)!=cluster_name])==1
+  
+  # Intersecting with genes that are DE inthe B cells
+  unique.degs <- is.de[,cluster_name]!=0 & not.de.other
+  unique.degs <- names(which(unique.degs))
+  
+  if (length(unique.degs) == 0) {
+    return(NULL)
+  } else {
+    # Inspecting the results.
+    de.allantois <- de.results[[cluster_name]]
+    de.allantois <- de.allantois[unique.degs,]
+    de.allantois <- de.allantois[order(de.allantois$PValue),]
+    de.allantois <- as.data.frame(de.allantois) %>% mutate(Identity = cluster_name)
+    return(de.allantois %>% rownames_to_column("Gene.name")) 
+  }
+}
+```
+
+```{r}
+de.results <- do_pseudobulk(seurat_obj_sub)
+de.specific <- map_dfr(names(de.results), find_specific_DE)
+
+# Up- or downregulated across most cell types.
+is.de <- decideTestsPerLabel(de.results, threshold=0.05)
+up.de <- is.de > 0 & !is.na(is.de)
+up.de <- sort(rowMeans(up.de), decreasing=TRUE)
+up.de <- data.frame(Percentage_CL = up.de[up.de > 0])
+
+down.de <- is.de < 0 & !is.na(is.de)
+down.de <- sort(rowMeans(down.de), decreasing=TRUE)
+down.de <- data.frame(Percentage_CL = down.de[down.de > 0])
+```
+
+```{r, eval=F}
+out_dir = "F:/TIMElab/GSE182109_processed/DE/level1"
+write.table(up.de, file= paste0(out_dir, "/up_DE_percentage_clusters.tsv"), quote=F, row.names=T, sep="\t")
+write.table(down.de, file= paste0(out_dir, "/down_DE_percentage_clusters.tsv"), quote=F, row.names=T, sep="\t")
+write.table(write_de_results(de.results), file= paste0(out_dir, "/DE_results.tsv"), quote=F, row.names=F, sep="\t")
+write.table(de.specific, file= paste0(out_dir, "/DE_results_CL-specific.tsv"), quote=F, row.names=F, sep="\t")
+```
+
+
+### SCIPAC
+
+```{r}
+load("F:/TIMElab/GSE182109_processed/SCIPAC/SCIPAC_data.RData")
+```
+
+```{r}
+seurat_obj@meta.data = seurat_obj@meta.data %>% rownames_to_column("cell_id") %>% left_join(SCIPAC.res %>% rownames_to_column("cell_id"), "cell_id") %>% column_to_rownames("cell_id")
+```
+
+```{r}
+head(seurat_obj)
+
+seurat_obj@meta.data %>% filter(cell.type.fine == "FB-like")
+```
+
+```{r}
+FeaturePlot(seurat_obj, c("Lambda.est", "log.pval")) +
+DimPlot(seurat_obj, group.by = "cell.type") +
+DimPlot(seurat_obj, group.by =  "sig")
+
+DimPlot(seurat_obj, group.by = "cluster_assignment")
+```
+
+```{r}
+ggplot(seurat_obj@meta.data,
+       aes(fill=sig, x=cell.type.fine)) + 
+    geom_bar(position="fill") +
+  coord_flip() +
+  theme_cowplot()
+```
+
+
+#### SCIPAC results
+
+```{r}
+load("F:/TIMElab/GSE182109_processed/SCIPAC/SCIPAC_res.RData")
+```
+
+```{r}
+seurat_obj@meta.data = seurat_obj@meta.data %>%
+  rownames_to_column("cell_id") %>%
+  left_join(
+    SCIPAC.res %>% select(cell_id, Lambda.est,  Lambda.upper, Lambda.lower, sig, log.pval)
+  ) %>%
+  column_to_rownames("cell_id")
+```
+
+```{r}
+head(seurat_obj)
+```
+
+```{r}
+FeaturePlot(
+  seurat_obj,
+  "log.pval"
+)
+```
+
+```{r}
+p = DimPlot(seurat_obj,
+        group.by = "sig",
+        cols = c("#E64B35FF", "#4DBBD5FF", "#ededed"),
+        raster.dpi =  c(512*2, 512*2))
+p
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures/FIG2", filename= "SCIPAC_sig.pdf", width=6.5*.8, height=5*.8, dpi=700)
+```
+
+
+```{r}
+plot_d = SCIPAC.res
+
+level_vec = SCIPAC.res %>%
+  group_by(cell.type, sig) %>%
+  summarise(Count = n()) %>%
+  ungroup() %>%
+  complete(cell.type, sig, fill = list(Count = 0)) %>%
+  group_by(cell.type) %>%
+  mutate(Freq = Count/sum(Count)) %>%
+  filter(sig == "Sig.pos") %>%
+  arrange(desc(Freq)) %>%
+  pull(cell.type)
+
+plot_d$cell.type = factor(plot_d$cell.type, levels = level_vec)
+plot_d$sig = factor(plot_d$sig, levels = c("Not.sig", "Sig.neg", "Sig.pos"))
+
+p = ggplot(plot_d,
+       aes(fill=sig, x=cell.type)) + 
+    geom_bar(position="fill") +
+  scale_fill_manual(values = c("Sig.pos" = "#E64B35FF", "Sig.neg" = "#4DBBD5FF", "Not.sig" = "#ededed")) +
+  coord_flip() +
+  theme_cowplot() +
+  labs(x = NULL, y = "Frequency") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+p
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures/FIG2", filename= "SCIPAC_sig_freq.pdf", width=5.8*.8, height=2.8*.8, dpi=700)
+
+```
+
+
+
+### Subclustering glioma cells
+
+```{r}
+seurat_obj_sub = subset(seurat_obj, idents = "Glioma")
+```
+
+```{r}
+DefaultAssay(seurat_obj_sub) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+rm(seurat_obj)
+seurat_obj_sub <- ScaleData(seurat_obj_sub, verbose = FALSE)
+seurat_obj_sub <- RunPCA(seurat_obj_sub, npcs = 30, verbose = FALSE)
+seurat_obj_sub <- RunUMAP(seurat_obj_sub, reduction = "pca", dims = 1:14)
+seurat_obj_sub <- FindNeighbors(seurat_obj_sub, reduction = "pca", dims = 1:14)
+seurat_obj_sub <- FindClusters(seurat_obj_sub, resolution = 0.3)
+```
+
+```{r}
+DimPlot(seurat_obj_sub)
+```
+
+
+#### Neftel subtypes
+
+```{r}
+library(scrabble)
+
+gene_set = readxl::read_xlsx("H:/TIMElab/Neftel/mmc2.xlsx")
+gene_set = as.list(gene_set)
+gene_set = lapply(gene_set, function(x){x[!is.na(x)]})
+
+# removing genes that are not in the matrix
+gene_set = lapply(gene_set, function(x){x[x%in%rownames(seurat_obj_sub)]})
+```
+
+Scoring glioma cells
+```{r}
+mat = seurat_obj_sub@assays$RNA@data
+mat = mat[rownames(mat)%in%unlist(gene_set),]
+
+sig_scores = scrabble::score(
+  mat = as.matrix(mat),
+  groups = gene_set,
+  replace = T
+)
+
+seurat_obj_sub@meta.data = seurat_obj_sub@meta.data %>%
+  rownames_to_column() %>%
+  left_join(
+    as.data.frame(sig_scores) %>% rownames_to_column(), "rowname"
+  ) %>%
+  column_to_rownames()
+```
+
+
+Assigning subtypes
+```{r}
+data = seurat_obj_sub@meta.data[,c("MES1", "MES2", "AC", "OPC", "NPC1", "NPC2")]
+highest_scoring = apply(data, 1, max)
+
+assign_hybrid_states <- function(sig_data) {
+  
+  scores = sort(sig_data, decreasing = T)
+  c2_data = data[,names(scores[2])][data[,names(scores[2])] == highest_scoring]
+  c2_data = c2_data[!is.na(c2_data)]
+  
+  c1 = scores[2]>1
+  c2 = mean(scores[2]>c2_data)>.1
+  c3 = (scores[2]-scores[3])>.3
+  
+  if (c1&c2&c3) {
+    hybrid_name = paste(sort(c(names(scores[1]), names(scores[2]))), collapse = "/")
+    return(hybrid_name)
+  } else {
+    return(names(scores[1]))
+  }
+  
+}
+
+seurat_obj_sub$neftel.subtype = apply(t(data), 2, assign_hybrid_states)
+seurat_obj_sub$neftel.subtype.pure = ifelse(grepl("/", seurat_obj_sub$neftel.subtype), NA, seurat_obj_sub$neftel.subtype)
+Idents(seurat_obj_sub) = "neftel.subtype.pure"
+```
+
+```{r}
+DimPlot(seurat_obj_sub, group.by = "neftel.subtype.pure")
+DimPlot(seurat_obj_sub, group.by = "neftel.subtype")
+```
+
+```{r}
+DimPlot(seurat_obj_sub, group.by = "neftel.subtype", split.by = "ECM.cluster")
+```
+
+
+
+```{r}
+write_tsv(seurat_obj_sub@meta.data %>%
+  rownames_to_column("Cell") %>%
+  select(Cell, cell.type.fine = neftel.subtype.pure),
+  "H:/TIMElab/GSE182109_processed/cell_anno/glioma.tsv")
+```
+
+
+#### Butterfly plots
+
+```{r}
+library(scrabble)
+
+scores = cbind(rowMeans(seurat_obj_sub@meta.data[,c("NPC1", "NPC2")]),
+rowMeans(seurat_obj_sub@meta.data[,c("MES1", "MES2")]),
+seurat_obj_sub@meta.data[,c("AC", "OPC")])
+colnames(scores) <- c("AC", "NPC", "MES", "OPC")
+
+hierarchy_data <- hierarchy(as.matrix(scores)[,c("AC", "NPC", "OPC", "MES")], log.scale=T)
+
+hierarchy_data$ECM.cluster <- seurat_obj_sub$ECM.cluster
+hierarchy_data$neftel.subtype <- seurat_obj_sub$neftel.subtype
+hierarchy_data$mGSC <- seurat_obj_sub$mGSC
+hierarchy_data$pGSC <- seurat_obj_sub$pGSC
+
+p = ggplot(hierarchy_data, aes(x=X, y=Y, color=ECM.cluster)) +
+  #stat_density_2d(aes(fill = ..level..), geom = "polygon")
+  geom_point(size = .1) +
+  xlab("Relative meta-module score\n[log2(|SC1-SC2|+1)]") +
+  ylab("Relative meta-module score\n[log2(|SC1-SC2|+1)]") +
+  geom_hline(yintercept = 0, lty=2) +
+  geom_vline(xintercept = 0, lty=2) +
+  scale_color_manual(values = palette_ECM_subtype) +
+  theme_cowplot(16)
+p
+```
+
+```{r}
+ggsave(p, path="H:/TIMElab/figures/FIG4", filename= "neftel_states_butterfly.pdf", width=6.5, height=5, dpi=700)
+```
+
+
+```{r}
+p = ggplot(hierarchy_data, aes(x=X, y=Y, color=mGSC)) +
+  #stat_density_2d(aes(fill = ..level..), geom = "polygon")
+  geom_point(size = .1) +
+  xlab("Relative meta-module score\n[log2(|SC1-SC2|+1)]") +
+  ylab("Relative meta-module score\n[log2(|SC1-SC2|+1)]") +
+  geom_hline(yintercept = 0, lty=2) +
+  geom_vline(xintercept = 0, lty=2) +
+  scale_color_continuous(type = "viridis") +
+  scale_x_continuous(breaks= c(-1, 0, 1)) +
+  scale_y_continuous(breaks= c(-1, 0, 1)) +
+  facet_grid(~ ECM.cluster) +
+  #scale_color_manual(values = palette_ECM_subtype) +
+  theme_cowplot(16)
+```
+
+```{r}
+ggsave(p, path="H:/TIMElab/figures/FIG4", filename= "neftel_states_butterfly_mGSC.pdf", width=7, height=3.8, dpi=700)
+```
+
+```{r}
+p = ggplot(hierarchy_data, aes(x=X, y=Y, color=pGSC)) +
+  #stat_density_2d(aes(fill = ..level..), geom = "polygon")
+  geom_point(size = .1) +
+  xlab("Relative meta-module score\n[log2(|SC1-SC2|+1)]") +
+  ylab("Relative meta-module score\n[log2(|SC1-SC2|+1)]") +
+  geom_hline(yintercept = 0, lty=2) +
+  geom_vline(xintercept = 0, lty=2) +
+  scale_color_continuous(type = "viridis") +
+   scale_x_continuous(breaks= c(-1, 0, 1)) +
+  scale_y_continuous(breaks= c(-1, 0, 1)) +
+  facet_grid(~ ECM.cluster) +
+  #scale_color_manual(values = palette_ECM_subtype) +
+  theme_cowplot(16)
+```
+
+```{r}
+ggsave(p, path="H:/TIMElab/figures/FIG4", filename= "neftel_states_butterfly_pGSC.pdf", width=7, height=3.8, dpi=700)
+```
+
+
+#### UMAP
+
+```{r}
+col_celltype_glioma <- RColorBrewer::brewer.pal(7, "Paired")
+names(col_celltype_glioma) = c("NPC1", "NPC2", "AC", "OPC", "MES1", "MES2")
+```
+
+```{r}
+umap_plot <- DimPlot(seurat_obj_sub,
+        label = F,
+        raster = T,
+        label.size = 5,
+        group.by = "neftel.subtype.pure",
+        #cols = col_celltype_glioma
+        ) +
+  #theme(legend.position = "none") +
+  labs(subtitle = NULL)
+umap_plot
+```
+
+```{r}
+ggsave(umap_plot, path="F:/TIMElab/figures", filename= "umap_glioma.pdf", width=6.2, height=5, dpi=700)
+```
+
+#### Marker genes
+
+Markers taken from https://ars.els-cdn.com/content/image/1-s2.0-S0092867419306877-gr2_lrg.jpg
+```{r}
+seurat_obj = seurat_obj[,!is.na(seurat_obj$neftel.subtype.pure)]
+
+
+DefaultAssay(seurat_obj_sub) <- "RNA"
+seurat_obj_sub  = NormalizeData(seurat_obj_sub )
+seurat_obj_sub  = ScaleData(seurat_obj_sub )
+Idents(seurat_obj_sub ) <- "neftel.subtype.pure"
+
+p = DotPlot(seurat_obj_sub[,!is.na(seurat_obj_sub$neftel.subtype.pure)],
+        features = c("DDIT3", "ENO2", "VIM", "ADM", "LDHA", "HILPDA", "ANXA1", "ANXA2", "CHI3L1", "CD44", "CST3", "S100B", "HOPX", "SLC1A3", "MLC1", "PLP1", "ALCAM", "OLIG1", "OMG", "PLLP", "SOX4", "DCX", "CD24", "DLL3", "SOX11", "RND3", "STMN4", "STMN2", "DLX5", "DLX6-AS1"), cluster.idents = T) +
+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+p
+```
+
+```{r}
+ggsave(p, path="H:/TIMElab/figures", filename= "markers_glioma.pdf", width=9, height=3.6, dpi=700)
+```
+
+
+#### Cell state frequency
+
+```{r, eval=F}
+library(ggpubr)
+library(rstatix)
+library(cowplot)
+library(tidyverse)
+
+freq_d = seurat_obj_sub@meta.data %>%
+  filter(ECM.cluster == "ECMlo" | ECM.cluster == "ECMhi") %>%
+  filter(!is.na(neftel.subtype.pure)) %>%
+  group_by(seq_folder, ECM.cluster, neftel.subtype.pure) %>%
+  summarise(Count = n()) %>%
+  mutate(Prop = Count/sum(Count))
+
+stat.test <- freq_d %>%
+  group_by(neftel.subtype.pure) %>%
+  t_test(Prop ~ ECM.cluster) %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(p.adj = signif(p.adj, 3), y.position = y.position + .2)
+
+
+p = ggviolin(freq_d,
+          x = "ECM.cluster",
+          y = "Prop",
+          add = c("boxplot", "jitter"),
+          color = "ECM.cluster",
+          palette = palette_ECM_subtype,
+          #facet.by = "Cluster",
+          outlier.shape = NA,
+          width = 0.6) +
+  #geom_dotplot(aes(fill = Cluster, color = Cluster), binaxis='y', stackdir='center', dotsize=.4) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="Frequency") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(legend.position = "none") +
+  ylim(0, 1.5) +
+  xlab(NULL)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.5
+p = facet(p, "neftel.subtype.pure", nrow = 1)
+p
+```
+
+```{r}
+ggsave(p, path="H:/TIMElab/figures", filename= "neftel_states_violin.pdf", width=6.2, height=3, dpi=700)
+```
+
+
+Butterfly plots?
+
+
+#### DE testing
+
+```{r}
+do_pseudobulk <- function(seurat_object) {
+  #de.results <- do_pseudobulk(merged_seurat)
+  library(scran)
+  library(scuttle)
+  library(edgeR)
+  library(Seurat)
+  library(tidyverse)
+  
+  DefaultAssay(seurat_object) <- "RNA"
+  merged_sce <- as.SingleCellExperiment(DietSeurat(seurat_object))
+  merged_sce@assays@data$logcounts <- NULL
+  summed <- scuttle::aggregateAcrossCells(merged_sce, 
+                                 id=colData(merged_sce)[,c("neftel.subtype.pure", "seq_folder")],
+                                 use.assay.type = 1)
+  summed.filt <- summed[,summed$ncells >= 10]
+  de.results <- pseudoBulkDGE(summed.filt, 
+                              label=summed.filt$neftel.subtype.pure,
+                              design=~factor(ECM.cluster),
+                              coef="factor(ECM.cluster)ECMlo",
+                              condition=summed.filt$ECM.cluster)
+  return(de.results)
+}
+
+find_specific_DE <- function(cluster_name) {
+  # Finds genes that are DE in a specific cluster but not others
+  
+  is.de <- decideTestsPerLabel(de.results, threshold=0.05)
+  
+  # Finding all genes that are not remotely DE in all other labels.
+  remotely.de <- decideTestsPerLabel(de.results, threshold=0.5)
+  not.de <- remotely.de==0 | is.na(remotely.de)
+  not.de.other <- rowMeans(not.de[,colnames(not.de)!=cluster_name])==1
+  
+  # Intersecting with genes that are DE inthe B cells
+  unique.degs <- is.de[,cluster_name]!=0 & not.de.other
+  unique.degs <- names(which(unique.degs))
+  
+  if (length(unique.degs) == 0) {
+    return(NULL)
+  } else {
+    # Inspecting the results.
+    de.allantois <- de.results[[cluster_name]]
+    de.allantois <- de.allantois[unique.degs,]
+    de.allantois <- de.allantois[order(de.allantois$PValue),]
+    de.allantois <- as.data.frame(de.allantois) %>% mutate(Identity = cluster_name)
+    return(de.allantois %>% rownames_to_column("Gene.name")) 
+  }
+}
+
+load_gene_annotations <- function() {
+  library("AnnotationHub")
+  # Connect to AnnotationHub
+  ah <- AnnotationHub()
+  
+  # Access the Ensembl database for organism
+  ahDb <- query(ah, 
+                pattern = c("Homo sapiens", "EnsDb"), 
+                ignore.case = TRUE)
+  
+  # Acquire the latest annotation files
+  id <- ahDb %>%
+    mcols() %>%
+    rownames() %>%
+    tail(n = 1)
+  
+  # Download the appropriate Ensembldb database
+  edb <- ah[[id]]
+  
+  # Extract gene-level information from database
+  annotations <- genes(edb, 
+                       return.type = "data.frame")
+  
+  # Select annotations of interest
+  annotations <- annotations %>%
+    dplyr::select(gene_id, gene_name, seq_name, gene_biotype, description)
+  
+  return(annotations)
+}
+
+write_de_results <- function(pseudobulk_out) {
+  # Formats the output as a nice table
+  #to_write <- write_de_results(de.results)
+  merged_df = data.frame()
+  for (i in names(pseudobulk_out)) {
+    merged_df_sub <- as.data.frame(pseudobulk_out[[i]]) %>%
+      #dplyr::filter(FDR < 0.05) %>%
+      mutate(Cell.type = i) %>%
+      arrange(FDR) %>%
+      drop_na() %>%
+      rownames_to_column("Gene.name")
+    
+    merged_df <- rbind(merged_df, merged_df_sub)
+  }
+  merged_df <- merged_df  %>%
+    left_join(y = unique(annotations[, c("gene_name", "description")]),
+              by = c("Gene.name" = "gene_name"))
+  return(merged_df)
+}
+```
+
+```{r}
+de.results <- do_pseudobulk(seurat_obj_sub[,seurat_obj_sub$ECM.cluster%in%c("ECMlo", "ECMhi")])
+de.specific <- map_dfr(names(de.results), find_specific_DE)
+
+# Up- or downregulated across most cell types.
+is.de <- decideTestsPerLabel(de.results, threshold=0.05)
+up.de <- is.de > 0 & !is.na(is.de)
+up.de <- sort(rowMeans(up.de), decreasing=TRUE)
+up.de <- data.frame(Percentage_CL = up.de[up.de > 0])
+
+down.de <- is.de < 0 & !is.na(is.de)
+down.de <- sort(rowMeans(down.de), decreasing=TRUE)
+down.de <- data.frame(Percentage_CL = down.de[down.de > 0])
+```
+
+```{r, eval=F}
+annotations <- load_gene_annotations()
+out_dir = "F:/TIMElab/GSE182109_processed/DE/glioma/"
+write.table(up.de, file= paste0(out_dir, "/up_DE_percentage_clusters.tsv"), quote=F, row.names=T, sep="\t")
+write.table(down.de, file= paste0(out_dir, "/down_DE_percentage_clusters.tsv"), quote=F, row.names=T, sep="\t")
+write.table(write_de_results(de.results), file= paste0(out_dir, "/DE_results.tsv"), quote=F, row.names=F, sep="\t")
+write.table(de.specific, file= paste0(out_dir, "/DE_results_CL-specific.tsv"), quote=F, row.names=F, sep="\t")
+```
+
+
+
+GSC markers such as CD44, S100A4, ALDH1A3 are upregulated in COL1hi subtype indicating higher stemness
+CD44 upregulated in MES1 and MES2 with p values 0.028993633 and 0.130788655
+S100A4 upregulated in MES2 with FDR 0.118401633
+
+
+#### Plotting gene expression
+
+
+```{r}
+#de.results <- do_pseudobulk(merged_seurat)
+library(scran)
+library(scuttle)
+library(edgeR)
+library(Seurat)
+library(tidyverse)
+
+DefaultAssay(seurat_obj_sub) <- "RNA"
+merged_sce <- as.SingleCellExperiment(DietSeurat(seurat_obj_sub[,seurat_obj_sub$ECM.cluster!="undefined"]))
+merged_sce@assays@data$logcounts <- NULL
+summed <- scuttle::aggregateAcrossCells(merged_sce, 
+                               id=colData(merged_sce)[,c("neftel.subtype.pure", "seq_folder")],
+                               use.assay.type = 1)
+```
+
+```{r}
+y <- DGEList(counts(summed), samples=colData(summed))
+keep <- filterByExpr(y, group=summed$ECM.cluster)
+table(keep)
+```
+
+```{r}
+y <- y[keep,]
+y <- calcNormFactors(y)
+```
+
+```{r}
+library(ggpubr)
+library(rstatix)
+library(cowplot)
+
+gene = "S100A4"
+mat = cpm(y, log=T)
+
+data = cbind(data.frame(Expression = mat[gene,]) ,
+      colData(summed))
+data$neftel.subtype = data$neftel.subtype.pure
+data = data %>% dplyr::select(ECM.cluster, Expression, neftel.subtype)
+
+stat.test <- data %>%
+  group_by(neftel.subtype) %>%
+  t_test(Expression ~ ECM.cluster) %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(p.adj = signif(p.adj, 3))
+
+
+p = ggviolin(data, x = "ECM.cluster", color = "ECM.cluster", y = "Expression", add = "boxplot",  palette = palette_ECM_subtype) +
+  stat_pvalue_manual(stat.test, label = "p.adj") + ylab("logCPM") + xlab(NULL)
+
+p = facet(p, facet.by = "neftel.subtype", nrow = 1) + theme_cowplot() + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures", filename= "S100A4_glioma_cells.pdf", width=7, height=3, dpi=700)
+```
+
+
+#### Stemness
+
+```{r}
+stemness_geneset <- read_tsv("H:/TIMElab/bulk_RNAseq/Stemness_Wang/stemness_scores.txt")
+stemness_geneset %>%
+  filter(Gene %in% rownames(seurat_obj_sub)) %>%
+  arrange(desc(PC1)) -> stemness_geneset
+```
+
+
+```{r}
+stemness_signatures = list()
+stemness_signatures[["mGSC"]] = stemness_geneset %>% head(50) %>% pull(Gene)
+stemness_signatures[["pGSC"]] = stemness_geneset %>% tail(50) %>% pull(Gene)
+```
+
+
+
+```{r}
+mat = as.matrix(seurat_obj_sub@assays$RNA@data)
+```
+
+
+```{r}
+avg_exprs = rowMeans(mat)
+genes_pass_qc = names(avg_exprs)[avg_exprs > median(avg_exprs)]
+genes_pass_qc = intersect(stemness_geneset, genes_pass_qc)
+length(genes_pass_qc)
+```
+100 genes pass QC filter
+
+```{r}
+sig_scores = scrabble::score(
+  mat = mat,
+  groups = stemness_signatures,
+  replace = T
+)
+
+seurat_obj_sub@meta.data = seurat_obj_sub@meta.data %>%
+  rownames_to_column() %>%
+  left_join(
+    as.data.frame(sig_scores) %>% rownames_to_column(), "rowname"
+  ) %>%
+  column_to_rownames()
+```
+
+```{r}
+seurat_obj_sub_sub = seurat_obj_sub[,seurat_obj_sub$ECM.cluster!="undefined"]
+seurat_obj_sub_sub = seurat_obj_sub_sub[,!is.na(seurat_obj_sub_sub$neftel.subtype.pure)]
+```
+
+
+```{r}
+p = VlnPlot(seurat_obj_sub, "mGSC", group.by = "neftel.subtype.pure", pt.size=0)
+ggsave(p, path="H:/TIMElab/figures", filename= "mGSC_signature.pdf", width=4, height=2.75, dpi=700)
+```
+
+```{r}
+p = VlnPlot(seurat_obj_sub_sub, "pGSC", group.by = "neftel.subtype.pure", pt.size=0)
+ggsave(p, path="H:/TIMElab/figures", filename= "pGSC_signature.pdf", width=4, height=2.75, dpi=700)
+```
+
+
+```{r}
+d = seurat_obj_sub@meta.data %>%
+  select(neftel.subtype.pure, ECM.cluster, mGSC, pGSC, seq_folder) %>%
+  group_by(ECM.cluster, seq_folder, neftel.subtype.pure) %>%
+  summarise(mGSC_mean = mean(mGSC), pGSC_mean = mean(pGSC)) %>%
+  dplyr::rename(mGSC = mGSC_mean, pGSC = pGSC_mean)
+  
+  
+stat.test <- d  %>%
+  group_by(neftel.subtype.pure) %>%
+  t_test(mGSC ~ ECM.cluster) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(y.position = y.position+.2) %>%
+  arrange(p.adj) %>%
+  mutate(y.position = y.position, p.adj = signif(p.adj,3))
+
+p = ggviolin(d,
+          x = "ECM.cluster",
+          y = "mGSC",
+          add = c("boxplot"),
+          color = "ECM.cluster",
+          palette = palette_ECM_subtype,
+          outlier.shape = NA,
+          width = 0.6) +
+  #geom_dotplot(aes(fill = Cluster, color = Cluster), binaxis='y', stackdir='center', dotsize=.4) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="Signature score") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(legend.position = "none") +
+  xlab(NULL)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p = facet(p, "neftel.subtype.pure", nrow = 1)
+p
+```
+```{r}
+ggsave(p, path="H:/TIMElab/figures", filename= "mGSC_signature_ECMcluster.pdf", width=6, height=3, dpi=700)
+```
+
+
+```{r}
+d = seurat_obj_sub_sub@meta.data %>%
+  select(neftel.subtype.pure, ECM.cluster, mGSC, pGSC, seq_folder) %>%
+  group_by(ECM.cluster, seq_folder, neftel.subtype.pure) %>%
+  summarise(mGSC_mean = mean(mGSC), pGSC_mean = mean(pGSC)) %>%
+  dplyr::rename(mGSC = mGSC_mean, pGSC = pGSC_mean)
+  
+  
+stat.test <- d  %>%
+  group_by(neftel.subtype.pure) %>%
+  t_test(pGSC ~ ECM.cluster) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(y.position = y.position+.2) %>%
+  arrange(p.adj) %>%
+  mutate(y.position = y.position+.5, p.adj = signif(p.adj,3))
+
+p = ggviolin(d,
+          x = "ECM.cluster",
+          y = "pGSC",
+          add = c("boxplot"),
+          color = "ECM.cluster",
+          palette = palette_ECM_subtype,
+          outlier.shape = NA,
+          width = 0.6) +
+  #geom_dotplot(aes(fill = Cluster, color = Cluster), binaxis='y', stackdir='center', dotsize=.4) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="Signature score") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(legend.position = "none") +
+  xlab(NULL)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p = facet(p, "neftel.subtype.pure", nrow = 1)
+p
+```
+
+```{r}
+ggsave(p, path="H:/TIMElab/figures", filename= "pGSC_signature_ECMcluster.pdf", width=6, height=3, dpi=700)
+```
+
+
+
+#### Co-stim expression
+
+```{r}
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+
+## remove the x-axis text and tick
+## plot.margin to adjust the white space between each plot.
+## ... pass any arguments to VlnPlot in Seurat
+modify_vlnplot<- function(obj, 
+                          feature, 
+                          pt.size = 0, 
+                          split.by_feature,
+                          plot.margin = unit(c(-0.75, 0, -0.75, 0), "cm"),
+                          ...) {
+  p<- VlnPlot(obj, features = feature, cols = palette_ECM_subtype, split.by = split.by_feature,  pt.size = pt.size, ... )  + 
+    xlab("") + ylab(feature) + ggtitle("") + 
+    theme(legend.position = "none", 
+          axis.text.x = element_blank(), 
+          axis.ticks.x = element_blank(), 
+          plot.title= element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_text(size = rel(1), angle = 0), 
+          axis.text.y = element_text(size = rel(1)), 
+          plot.margin = plot.margin ) 
+  return(p)
+}
+
+## extract the max value of the y axis
+extract_max<- function(p){
+  ymax<- max(ggplot_build(p)$layout$panel_scales_y[[1]]$range$range)
+  return(ceiling(ymax))
+}
+
+
+## main function
+StackedVlnPlot<- function(obj, features,
+                          pt.size = 0, 
+                          plot.margin = unit(c(-0.75, 0, -0.75, 0), "cm"),
+                          ...) {
+  
+  plot_list<- purrr::map(features, function(x) modify_vlnplot(obj = obj,feature = x, ...))
+  
+  # Add back x-axis title to bottom plot. patchwork is going to support this?
+  plot_list[[length(plot_list)]]<- plot_list[[length(plot_list)]] +
+    theme(axis.text.x=element_text(angle = 90, vjust = 0.5, hjust=1), axis.ticks.x = element_line())
+  
+  # change the y-axis tick to only max value 
+  ymaxs<- purrr::map_dbl(plot_list, extract_max)
+  plot_list<- purrr::map2(plot_list, ymaxs, function(x,y) x + 
+                            scale_y_continuous(breaks = c(y)) + 
+                            expand_limits(y = y))
+
+  p<- patchwork::wrap_plots(plotlist = plot_list, ncol = 1)
+  return(p)
+}
+```
+
+```{r}
+DefaultAssay(seurat_obj_sub) = "RNA"
+features_to_plot = c("CD40", "CD80", "CD86")
+
+p = StackedVlnPlot(obj = seurat_obj_sub, features = features_to_plot,
+                   split.by_feature = "ECM.cluster",
+                   plot.margin = unit(c(-0.85, 0, -0.85, 0)))
+
+p
+
+ggsave(p, path="C:/Users/mzarodn2/Documents", filename= "CXCL_expression.pdf", width=6, height=6, dpi=700)
+```
+
+
+
+#### Saving data
+
+```{r}
+saveRDS(seurat_obj_sub, "H:/TIMElab/GSE182109_processed/glioma.rds")
+```
+
+```{r}
+<<<<<<< HEAD
+seurat_obj_sub = readRDS("F:/TIMElab/GSE182109_processed/glioma.rds")
+=======
+seurat_obj_sub = readRDS("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/glioma.rds")
+>>>>>>> c284d2bb853c8a8da396d5809535052f12ac5c21
+```
+
+
+
+### CXCL signaling
+
+```{r}
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+
+## remove the x-axis text and tick
+## plot.margin to adjust the white space between each plot.
+## ... pass any arguments to VlnPlot in Seurat
+modify_vlnplot<- function(obj, 
+                          feature, 
+                          pt.size = 0, 
+                          split.by_feature,
+                          plot.margin = unit(c(-0.75, 0, -0.75, 0), "cm"),
+                          ...) {
+  p<- VlnPlot(obj, features = feature, idents = c("ECMhi", "ECMlo"), group.by = "cell.type.fine.collapsed", cols = palette_ECM_subtype, split.by = split.by_feature,  pt.size = pt.size, ... )  + 
+    xlab("") + ylab(feature) + ggtitle("") + 
+    theme(legend.position = "none", 
+          axis.text.x = element_blank(), 
+          axis.ticks.x = element_blank(), 
+          plot.title= element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_text(size = rel(1), angle = 0), 
+          axis.text.y = element_text(size = rel(1)), 
+          plot.margin = plot.margin ) 
+  return(p)
+}
+
+## extract the max value of the y axis
+extract_max<- function(p){
+  ymax<- max(ggplot_build(p)$layout$panel_scales_y[[1]]$range$range)
+  return(ceiling(ymax))
+}
+
+
+## main function
+StackedVlnPlot<- function(obj, features,
+                          pt.size = 0, 
+                          plot.margin = unit(c(-0.75, 0, -0.75, 0), "cm"),
+                          ...) {
+  
+  plot_list<- purrr::map(features, function(x) modify_vlnplot(obj = obj,feature = x, ...))
+  
+  # Add back x-axis title to bottom plot. patchwork is going to support this?
+  plot_list[[length(plot_list)]]<- plot_list[[length(plot_list)]] +
+    theme(axis.text.x=element_text(angle = 90, vjust = 0.5, hjust=1), axis.ticks.x = element_line())
+  
+  # change the y-axis tick to only max value 
+  ymaxs<- purrr::map_dbl(plot_list, extract_max)
+  plot_list<- purrr::map2(plot_list, ymaxs, function(x,y) x + 
+                            scale_y_continuous(breaks = c(y)) + 
+                            expand_limits(y = y))
+
+  p<- patchwork::wrap_plots(plotlist = plot_list, ncol = 1)
+  return(p)
+}
+```
+
+
+```{r}
+seurat_obj$cell.type.fine.collapsed = if_else(as.character(seurat_obj$cell.type)=="Mural cell", as.character(seurat_obj$cell.type.fine), as.character(seurat_obj$cell.type))
+Idents(seurat_obj) = "cell.type.fine.collapsed"
+```
+
+```{r}
+Idents(seurat_obj) = "ECM.cluster"
+features_to_plot = c("CXCL1", "CXCL2", "CXCL3", "CCL2", "CXCL12", "CCR2", "CXCR4")
+p = StackedVlnPlot(obj = seurat_obj, features = features_to_plot,
+                   split.by_feature = "ECM.cluster",
+                   plot.margin = unit(c(-0.85, 0, -0.85, 0)))
+ggsave(p, path="F:/TIMElab/figures/FIG3/", filename= "cellchat_CXCL_expression.pdf", width=6, height=6, dpi=700)
+```
+
+
+```{r}
+features_to_plot = c("POSTN", "ITGAV", "ITGB5", "CSF1", "CSF1R", "IL1B", "IL1R2")
+p = StackedVlnPlot(obj = seurat_obj, features = features_to_plot, split.by_feature = "ECM.cluster", plot.margin = unit(c(-0.85, 0, -0.85, 0)))
+ggsave(p, path="C:/Users/mzarodn2/Documents", filename= "POSTN_expression.pdf", width=6, height=6, dpi=700)
+```
+
+```{r}
+features_to_plot = c("ANGPTL4", "ITGA5", "ITGB1", "CDH11", "SDC2")
+p = StackedVlnPlot(obj = seurat_obj, features = features_to_plot, split.by_feature = "ECM.cluster", plot.margin = unit(c(-0.85, 0, -0.85, 0)))
+ggsave(p, path="C:/Users/mzarodn2/Documents", filename= "ANGPTL_expression.pdf", width=6, height=5, dpi=700)
+```
+
+
+
+
+
+
+```{r}
+DefaultAssay(seurat_obj_sub) <- "RNA"
+
+VlnPlot(seurat_obj$ECMhi, c("CXCL1", "CXCL2", "CXCL3", "CXCL6", "CXCL8", "CXCL12", "POSTN"), idents = "P-FB", ncol = 7, same.y.lims = T)
+?VlnPlot
+```
+
+
+
+
+### ANGPTL signaling
+
+```{r}
+Idents(seurat_obj) <- "neftel.subtype.pure"
+DefaultAssay(seurat_obj_sub) <- "RNA"
+
+
+selection = !is.na(seurat_obj_sub$neftel.subtype.pure) & seurat_obj_sub$ECM.cluster!="undefined"
+seurat_obj_sub = seurat_obj_sub[,selection]
+```
+
+```{r}
+angptl_pathway = c("ANGPTL4", "ITGA5", "ITGB1", "CDH5", "CDH11", "SDC2", "SDC3", "SDC4")
+```
+
+
+```{r}
+p = VlnPlot(seurat_obj_sub, angptl_pathway,
+            split.by = "ECM.cluster", cols = palette_ECM_subtype, ncol = 2)
+p
+ggsave(p, path="H:/TIMElab/figures/FIG4", filename= "ANGPTL4_glioma.pdf", width=5.5, height=9, dpi=700)
+
+
+p = VlnPlot(seurat_obj_sub, angptl_pathway,
+            split.by = "ECM.cluster", cols = palette_ECM_subtype, ncol = 2)
+p
+ggsave(p, path="H:/TIMElab/figures/FIG4", filename= "ANGPTL4_glioma_pts.pdf", width=5.5, height=9, dpi=700)
+```
+
+EGFR expression
+```{r}
+p = VlnPlot(seurat_obj_sub, c("SDC2", "SDC4", "FZD3", "FGFR1"),
+            split.by = "ECM.cluster", cols = palette_ECM_subtype, ncol = 2, pt.size = 0)
+ggsave(p, path="H:/TIMElab/figures/FIG4", filename= "Receptors_glioma.pdf", width=4.5, height=5, dpi=700)
+```
+
+
+
+In pericytes
+
+```{r}
+seurat_obj_sub = readRDS("F:/TIMElab/GSE182109_processed/muralcells.rds")
+```
+
+```{r}
+palette_ECM_subtype = c("COL1hi" = "#E64B35FF", "COL1lo" = "#4DBBD5FF")
+
+Idents(seurat_obj_sub) <- "cell.type.fine"
+DefaultAssay(seurat_obj_sub) <- "RNA"
+
+
+selection = seurat_obj_sub$ECM.cluster!="undefined" & seurat_obj_sub$cell.type.fine=="FB-like"
+seurat_obj_sub = seurat_obj_sub[,selection]
+```
+
+```{r}
+p = VlnPlot(seurat_obj_sub, c("ANGPTL4", "WNT5A", "FGF7"),
+            split.by = "ECM.cluster", cols = palette_ECM_subtype, ncol = 3)
+p
+ggsave(p, path="F:/TIMElab/figures/FIG4", filename= "Ligands_FBlike.pdf", width=5.5, height=3, dpi=700)
+```
+
+```{r}
+p = VlnPlot(seurat_obj_sub, "WNT5A",
+            split.by = "ECM.cluster", cols = palette_ECM_subtype,ncol = 2)
+p
+ggsave(p, path="F:/TIMElab/figures/FIG4", filename= "WNT5A_FBlike.pdf", width=3.5, height=3, dpi=700)
+```
+
+```{r}
+p = VlnPlot(seurat_obj_sub, "FGF7",
+            split.by = "ECM.cluster", cols = palette_ECM_subtype,ncol = 2)
+p
+ggsave(p, path="F:/TIMElab/figures/FIG4", filename= "FGF7_FBlike.pdf", width=3.5, height=3, dpi=700)
+```
+
+### EGFR
+```{r}
+p = VlnPlot(seurat_obj, "EGFR",
+            split.by = "ECM.cluster", group.by = "cell.type.fine", cols = palette_ECM_subtype, pt.size = 0, ncol = 2)
+p
+ggsave(p, path="H:/TIMElab/figures", filename= "ANGPTL4_glioma.pdf", width=5.5, height=9, dpi=700)
+```
+
+
+### OPN signaling
+
+```{r}
+palette_ECM_subtype = c("COL1hi" = "#E64B35FF", "COL1lo" = "#4DBBD5FF")
+
+Idents(seurat_obj) <- "cell.type.fine"
+DefaultAssay(seurat_obj) <- "RNA"
+VlnPlot(seurat_obj, "CD29", pt.size = 0, split.by = "ECM.cluster")
+```
+
+
+
+
+
+
+
+
+```{r}
+p = VlnPlot(seurat_obj, c("SDC2"), group.by = "cell.type.fine", split.by = "ECM.cluster",  pt.size = 0, cols = palette_ECM_subtype)
+ggsave(p, path="F:/TIMElab/figures", filename= "SDC2_glioma_pericyte.pdf", width=6, height=2.75, dpi=700)
+```
+
+```{r}
+p = VlnPlot(seurat_obj, c("SDC4"), group.by = "cell.type.fine", split.by = "ECM.cluster",  pt.size = 0, cols = palette_ECM_subtype)
+ggsave(p, path="F:/TIMElab/figures", filename= "SDC4_glioma_pericyte.pdf", width=6, height=2.75, dpi=700)
+```
+
+```{r}
+p = VlnPlot(seurat_obj, c("ITGB1"), group.by = "cell.type.fine", split.by = "ECM.cluster",  pt.size = 0, cols = palette_ECM_subtype)
+ggsave(p, path="F:/TIMElab/figures", filename= "ITGB1_glioma_pericyte.pdf", width=6, height=2.75, dpi=700)
+```
+
+```{r}
+p = VlnPlot(seurat_obj, c("TGFBR1"), group.by = "cell.type.fine", split.by = "ECM.cluster",  pt.size = 0, cols = palette_ECM_subtype)
+ggsave(p, path="F:/TIMElab/figures", filename= "ITGB1_glioma_pericyte.pdf", width=6, height=2.75, dpi=700)
+```
+
+
+### Subclustering T cells
+
+```{r}
+seurat_obj_sub = subset(seurat_obj, idents = "T cell")
+DefaultAssay(seurat_obj_sub) = "RNA"
+```
+
+```{r}
+DefaultAssay(seurat_obj_sub) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+seurat_obj_sub <- ScaleData(seurat_obj_sub, verbose = FALSE)
+seurat_obj_sub <- RunPCA(seurat_obj_sub, npcs = 30, verbose = FALSE)
+seurat_obj_sub <- RunUMAP(seurat_obj_sub, reduction = "pca", dims = 1:6)
+seurat_obj_sub <- FindNeighbors(seurat_obj_sub, reduction = "pca", dims = 1:6)
+seurat_obj_sub <- FindClusters(seurat_obj_sub, resolution = 0.5)
+```
+
+```{r}
+DimPlot(seurat_obj_sub)
+```
+#### Marker genes
+
+```{r}
+t_markers = c("PTPRC", "CD3E", "CD4", "CD8A", "TCF7", "CCR7", "LAG3", "PDCD1", "FOXP3", "IL2RA", "CTLA4", "TIGIT", "KLRB1", "HOPX", "S100A4", "JUNB", "GZMB", "IFNG", "NKG7", "GNLY", "MKI67", "GZMH", "KLRD1", "SELL", "CD69", "CD86", "ICAM1", "OLIG1", "SOX9")
+DefaultAssay(seurat_obj_sub) <- "RNA"
+seurat_obj_sub = ScaleData(seurat_obj_sub)
+p = DotPlot(seurat_obj_sub,
+        features = t_markers,
+        cluster.idents = T) + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+p
+```
+
+
+
+
+
+```{r}
+Idents(seurat_obj_sub) <- "integrated_snn_res.0.5"
+seurat_obj_sub <- RenameIdents(object = seurat_obj_sub, 
+                              "0" = "CD8+ Teff",
+                              "1" = "CD4+ Tn",
+                              "2" = "CD8+ Teff",
+                              "3" = "CD4+ Tn",
+                              "4" = "CD8+ Teff",
+                              "5" = "CD8+ Teff",
+                              "6" = "CD4+ Treg",
+                              "7" = "NK",
+                              "8" = "CD4+ Teff",
+                           "9" = "CD4+ Tn",
+                           "10" = "CD8+ prolif.")
+seurat_obj_sub$cell.type.fine = Idents(seurat_obj_sub)
+DimPlot(seurat_obj_sub, label = TRUE)
+```
+```{r}
+write_tsv(seurat_obj_sub@meta.data %>%
+  rownames_to_column("Cell") %>%
+  dplyr::select(Cell, cell.type.fine),
+  "F:/TIMElab/GSE182109_processed/cell_anno/tcells.tsv")
+```
+
+
+
+#### Gene markers
+
+```{r}
+DefaultAssay(seurat_obj_sub) <- "RNA"
+p = DotPlot(seurat_obj_sub,
+        features = t_markers,
+        cluster.idents = T) + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+p
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures", filename= "markers_tcells.pdf", width=9, height=4, dpi=700)
+```
+
+
+#### Cell state frequency
+
+```{r, eval=F}
+library(ggpubr)
+library(rstatix)
+library(cowplot)
+library(tidyverse)
+
+freq_d = seurat_obj_sub@meta.data %>%
+  dplyr::filter(ECM.cluster == "ECMlo" | ECM.cluster == "ECMhi") %>%
+  group_by(seq_folder, ECM.cluster, cell.type.fine) %>%
+  summarise(Count = n()) %>%
+  mutate(Prop = Count/sum(Count))
+
+stat.test <- freq_d %>%
+  group_by(cell.type.fine) %>%
+  t_test(Prop ~ ECM.cluster) %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(p.adj = signif(p.adj, 3), y.position = y.position + .2)
+
+
+p = ggviolin(freq_d,
+          x = "ECM.cluster",
+          y = "Prop",
+          add = c("boxplot", "jitter"),
+          color = "ECM.cluster",
+          palette = palette_ECM_subtype,
+          #facet.by = "Cluster",
+          outlier.shape = NA,
+          width = 0.6) +
+  #geom_dotplot(aes(fill = Cluster, color = Cluster), binaxis='y', stackdir='center', dotsize=.4) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="Frequency") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(legend.position = "none") +
+  ylim(0, 1.3) +
+  xlab(NULL)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.5
+p = facet(p, "cell.type.fine", nrow = 1)
+p
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures", filename= "tcells_violin.pdf", width=7.2, height=3, dpi=700)
+```
+
+
+#### MiloR
+
+Prepare the data and the env
+```{r}
+library(miloR)
+library(SingleCellExperiment)
+library(scater)
+library(dplyr)
+library(Seurat)
+library(patchwork)
+
+seurat_obj_sub = seurat_obj_sub[,seurat_obj_sub $ECM.cluster!="undefined"]
+DefaultAssay(seurat_obj_sub) <- "RNA"
+
+seurat_sce <- as.SingleCellExperiment(seurat_obj_sub)
+seurat_sce <- swapAltExp(seurat_sce, "integrated")
+seurat_milo <- Milo(seurat_sce)
+reducedDim(seurat_milo, "UMAP") <- reducedDim(seurat_sce, "UMAP")
+rm(seurat_sce)
+```
+
+```{r}
+seurat_milo <- buildGraph(seurat_milo, k = 24, d = 30)
+seurat_milo <- makeNhoods(seurat_milo, prop = .1, k = 24, d=30, refined = TRUE)
+plotNhoodSizeHist(seurat_milo)
+```
+
+
+Counting cells in neighborhoods
+```{r}
+seurat_milo <- countCells(seurat_milo, meta.data = data.frame(colData(seurat_milo)), sample="seq_folder")
+```
+
+DA testing
+```{r}
+traj_design <- data.frame(colData(seurat_milo))[,c("seq_folder", "ECM.cluster")]
+traj_design <- distinct(traj_design)
+rownames(traj_design) <- traj_design$seq_folder
+traj_design$ECM.cluster <- factor(traj_design$ECM.cluster)
+traj_design$ECM.cluster <- relevel(traj_design$ECM.cluster, "ECMlo")
+```
+
+Cydar package introduces spatial FDR correction which accounts for overlaps between neighborhoods. It was initially developed for mass cytometry data. It weights each hypothesis P-value by the reciprocal (1/x) of the kth nearest neighbor distance.
+```{r}
+da_results_1 <- testNhoods(seurat_milo, design = ~ ECM.cluster, design.df = traj_design, fdr.weighting="graph-overlap")
+da_results_1 %>%
+  filter(FDR < 0.05)
+```
+
+```{r}
+library(scales)
+seurat_milo <- buildNhoodGraph(seurat_milo)
+col <- scale_fill_gradient2(low = muted("blue"),
+                            mid = "white",
+                            high = muted("red"),
+                            midpoint = 0)
+p1 <- plotNhoodGraphDA(seurat_milo, da_results_1, alpha=0.05) + col + labs(fill = "logFC")
+```
+MiloR plot
+```{r, eval=F}
+ggsave(p1, path="H:/TIMElab/figures/FIG3", filename= "miloR_tcell.pdf", width=9*.7, height=7*.7, dpi=700)
+```
+
+UMAP plot
+```{r, eval=F}
+p = DimPlot(seurat_obj_sub, label = T, group.by = "cell.type.fine", label.size = 5) + theme_void()
+ggsave(p, path="H:/TIMElab/figures/FIG3", filename= "umap_tcell.pdf", width=8*.6, height=7*.6, dpi=700)
+```
+
+Split by ECM subtype
+```{r}
+p = DimPlot(seurat_obj_sub,  group.by = "ECM.cluster", split.by = "ECM.cluster", cols = palette_ECM_subtype, ncol = 1) + theme_void()
+ggsave(p, path="H:/TIMElab/figures/FIG3", filename= "umap_tcell_ECM_subtype.pdf", width=4.5*1.2, height=7*1.2, dpi=700)
+```
+
+
+#### DE testing
+
+```{r}
+do_pseudobulk <- function(seurat_object) {
+  #de.results <- do_pseudobulk(merged_seurat)
+  library(scran)
+  library(scuttle)
+  library(edgeR)
+  library(Seurat)
+  library(tidyverse)
+  
+  DefaultAssay(seurat_object) <- "RNA"
+  merged_sce <- as.SingleCellExperiment(DietSeurat(seurat_object))
+  merged_sce@assays@data$logcounts <- NULL
+  summed <- scuttle::aggregateAcrossCells(merged_sce, 
+                                 id=colData(merged_sce)[,c("cell.type.fine", "seq_folder")],
+                                 use.assay.type = 1)
+  summed.filt <- summed[,summed$ncells >= 10]
+  de.results <- pseudoBulkDGE(summed.filt, 
+                              label=summed.filt$cell.type.fine,
+                              design=~factor(ECM.cluster),
+                              coef="factor(ECM.cluster)ECMlo",
+                              condition=summed.filt$ECM.cluster)
+  return(de.results)
+}
+
+find_specific_DE <- function(cluster_name) {
+  # Finds genes that are DE in a specific cluster but not others
+  
+  is.de <- decideTestsPerLabel(de.results, threshold=0.05)
+  
+  # Finding all genes that are not remotely DE in all other labels.
+  remotely.de <- decideTestsPerLabel(de.results, threshold=0.5)
+  not.de <- remotely.de==0 | is.na(remotely.de)
+  not.de.other <- rowMeans(not.de[,colnames(not.de)!=cluster_name])==1
+  
+  # Intersecting with genes that are DE inthe B cells
+  unique.degs <- is.de[,cluster_name]!=0 & not.de.other
+  unique.degs <- names(which(unique.degs))
+  
+  if (length(unique.degs) == 0) {
+    return(NULL)
+  } else {
+    # Inspecting the results.
+    de.allantois <- de.results[[cluster_name]]
+    de.allantois <- de.allantois[unique.degs,]
+    de.allantois <- de.allantois[order(de.allantois$PValue),]
+    de.allantois <- as.data.frame(de.allantois) %>% mutate(Identity = cluster_name)
+    return(de.allantois %>% rownames_to_column("Gene.name")) 
+  }
+}
+
+load_gene_annotations <- function() {
+  library("AnnotationHub")
+  # Connect to AnnotationHub
+  ah <- AnnotationHub()
+  
+  # Access the Ensembl database for organism
+  ahDb <- query(ah, 
+                pattern = c("Homo sapiens", "EnsDb"), 
+                ignore.case = TRUE)
+  
+  # Acquire the latest annotation files
+  id <- ahDb %>%
+    mcols() %>%
+    rownames() %>%
+    tail(n = 1)
+  
+  # Download the appropriate Ensembldb database
+  edb <- ah[[id]]
+  
+  # Extract gene-level information from database
+  annotations <- genes(edb, 
+                       return.type = "data.frame")
+  
+  # Select annotations of interest
+  annotations <- annotations %>%
+    dplyr::select(gene_id, gene_name, seq_name, gene_biotype, description)
+  
+  return(annotations)
+}
+
+write_de_results <- function(pseudobulk_out) {
+  # Formats the output as a nice table
+  #to_write <- write_de_results(de.results)
+  merged_df = data.frame()
+  for (i in names(pseudobulk_out)) {
+    merged_df_sub <- as.data.frame(pseudobulk_out[[i]]) %>%
+      #dplyr::filter(FDR < 0.05) %>%
+      mutate(Cell.type = i) %>%
+      arrange(FDR) %>%
+      drop_na() %>%
+      rownames_to_column("Gene.name")
+    
+    merged_df <- rbind(merged_df, merged_df_sub)
+  }
+  merged_df <- merged_df  %>%
+    left_join(y = unique(annotations[, c("gene_name", "description")]),
+              by = c("Gene.name" = "gene_name"))
+  return(merged_df)
+}
+```
+
+```{r}
+de.results <- do_pseudobulk(seurat_obj_sub[,seurat_obj_sub$ECM.cluster%in%c("ECMlo", "ECMhi")])
+de.specific <- map_dfr(names(de.results), find_specific_DE)
+
+# Up- or downregulated across most cell types.
+is.de <- decideTestsPerLabel(de.results, threshold=0.05)
+up.de <- is.de > 0 & !is.na(is.de)
+up.de <- sort(rowMeans(up.de), decreasing=TRUE)
+up.de <- data.frame(Percentage_CL = up.de[up.de > 0])
+
+down.de <- is.de < 0 & !is.na(is.de)
+down.de <- sort(rowMeans(down.de), decreasing=TRUE)
+down.de <- data.frame(Percentage_CL = down.de[down.de > 0])
+```
+
+```{r, eval=F}
+annotations <- load_gene_annotations()
+out_dir = "F:/TIMElab/GSE182109_processed/DE/tcells/"
+write.table(up.de, file= paste0(out_dir, "/up_DE_percentage_clusters.tsv"), quote=F, row.names=T, sep="\t")
+write.table(down.de, file= paste0(out_dir, "/down_DE_percentage_clusters.tsv"), quote=F, row.names=T, sep="\t")
+write.table(write_de_results(de.results), file= paste0(out_dir, "/DE_results.tsv"), quote=F, row.names=F, sep="\t")
+write.table(de.specific, file= paste0(out_dir, "/DE_results_CL-specific.tsv"), quote=F, row.names=F, sep="\t")
+```
+
+
+#### GSEA
+
+```{r}
+de.results = read_tsv("H:/TIMElab/GSE182109_processed/DE/tcells/DE_results.tsv")
+reactome_out = reactome_CP_DE(de.results)
+write_tsv(reactome_out, "H:/TIMElab/GSE182109_processed/DE/tcells/reactome.tsv")
+```
+
+
+## Subclustering Myeloid cells
+
+```{r}
+
+```
+
+
+```{r}
+Idents(seurat_obj) = "cell.type" 
+seurat_obj_sub = subset(seurat_obj, idents = "Myeloid")
+DefaultAssay(seurat_obj_sub) = "RNA"
+rm(seurat_obj)
+```
+
+```{r}
+DefaultAssay(seurat_obj_sub) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+seurat_obj_sub <- ScaleData(seurat_obj_sub, verbose = FALSE)
+seurat_obj_sub <- RunPCA(seurat_obj_sub, npcs = 30, verbose = FALSE)
+seurat_obj_sub <- RunUMAP(seurat_obj_sub, reduction = "pca", dims = 1:13)
+seurat_obj_sub <- FindNeighbors(seurat_obj_sub, reduction = "pca", dims = 1:13)
+seurat_obj_sub <- FindClusters(seurat_obj_sub, resolution = 0.3)
+```
+
+```{r}
+DimPlot(seurat_obj_sub)
+```
+
+
+#### Pseudobulk
+
+```{r}
+library(scuttle)
+library(edgeR)
+
+DefaultAssay(seurat_obj_sub) <- "RNA"
+
+merged_sce <- as.SingleCellExperiment(DietSeurat(seurat_obj_sub))
+merged_sce@assays@data$logcounts <- NULL
+summed <- aggregateAcrossCells(merged_sce, 
+                               id=colData(merged_sce)[,c("seq_folder", "cell.type.fine")],
+                               use.assay.type = 1)
+
+
+```
+
+```{r}
+y <- DGEList(counts(summed), samples=colData(summed))
+```
+
+```{r}
+keep <- filterByExpr(y)
+table(keep)
+
+y <- y[keep,]
+summary(keep)
+
+y <- calcNormFactors(y)
+```
+
+```{r}
+plotMDS(cpm(y, log=TRUE))
+```
+
+```{r}
+y$log2cpm = cpm(y, log=TRUE)
+```
+
+```{r}
+saveRDS(y, "H:/TIMElab/GSE182109_processed/myeloid_pseudobulk.rds")
+```
+
+
+
+
+
+
+
+
+##### M2 heatmap
+
+```{r}
+myeloid_bulk <- readRDS("F:/TIMElab/GSE182109_processed/myeloid_pseudobulk.rds")
+```
+
+```{r}
+m1 <- c("CD68", "HLA-DPB1", "HLA-DPA1", "HLA-DOA", "HLA-DQA1", "HLA-DQB1", "HLA-DRA", "HLA-DRB1", "TLR2", "TLR4", "SOCS3", "TNF", "IL1B", "IL6", "IL12", "IL23", "CCL10", "CCL11", "CCL5", "CCL8", "CCL9", "CCL2", "CCL3", "CCL4", "CD86", "CD80", "ICOSLG", "TNFSF4")
+m2 <- c("CD163", "LIF", "VEGFA", "SR", "MRC1", "CD200R1", "TGM2", "TNFRSF6B", "IL1R2", "IL10", "TGFB1", "IL-1ra", "CCL17", "CCL22", "CCL24", "CXCL10", "CXCL16")
+
+m_markers = rbind(
+  data.frame(Gene = m1, Phenotype = "M1"),
+  data.frame(Gene = m2, Phenotype = "M2")
+)
+
+
+rownames(m_markers) <- m_markers$Gene
+
+mat = myeloid_bulk$log2cpm
+```
+
+```{r}
+average_myeloid_bulk = myeloid_bulk$log2cpm %>%
+  as.data.frame() %>%
+  rownames_to_column("Gene") %>%
+  pivot_longer(!Gene, names_to = "Sample", values_to = "logCPM") %>%
+  left_join(
+    myeloid_bulk$samples %>% rownames_to_column("Sample") %>% select(Sample, cell.type.fine, ECM.cluster)
+  ) %>%
+  filter(ECM.cluster != "undefined") %>%
+  group_by(Gene, cell.type.fine, ECM.cluster) %>%
+  summarise(mean_logCPM = mean(logCPM))
+```
+
+
+```{r}
+average_myeloid_bulk = average_myeloid_bulk %>%
+  unite(Sample_name, c("cell.type.fine", "ECM.cluster")) %>%
+  pivot_wider(names_from = Sample_name, values_from = "mean_logCPM") %>%
+  column_to_rownames("Gene")
+
+mat = as.matrix(average_myeloid_bulk)
+```
+
+
+
+```{r}
+library(ComplexHeatmap)
+
+mat_sub = mat[rownames(mat)%in%m_markers$Gene,]
+mat_sub = t(scale(t(mat_sub)))
+
+column_ha = HeatmapAnnotation("ECM subtype" = str_split(colnames(mat_sub), "_", Inf, T)[,2],
+                              col = list("ECM subtype" = palette_ECM_subtype),
+                              simple_anno_size = unit(.2, "cm"),
+                              show_annotation_name = F)
+
+ht = Heatmap(mat_sub,
+             name = "Scaled logCPM",
+        column_split = factor(str_split(colnames(mat_sub), "_", Inf, T)[,1], levels = c("s-Mac1", "s-Mac2", "DC", "MDSC", "Prolif.", "AP-Mic", "iMic", "h-Mic")),
+        col = colorRamp2(seq(-2.5, 2.5, length.out=9), rev(brewer.pal(n=9, name="YlGnBu"))),
+        row_split = m_markers[rownames(mat_sub),]$Phenotype,
+        show_column_names = F,
+        cluster_column_slices = F,
+        top_annotation = column_ha,
+        width = unit(6, "cm"),
+        height = unit(9, "cm"),
+        column_title_rot = 90,
+        show_row_dend = F,
+        show_column_dend = F)
+
+ht
+```
+
+```{r}
+pdf(paste0("F:/TIMElab/figures/FIG3/", "myeloid_polarization.pdf"), width = 10, height = 7)
+draw(ht)
+dev.off()
+```
+
+```{r}
+library(ComplexHeatmap)
+
+mat_sub = mat[rownames(mat)%in%m_markers$Gene[grepl("HLA", m_markers$Gene)],]
+mat_sub = t(scale(t(mat_sub)))
+
+column_ha = HeatmapAnnotation("ECM subtype" = str_split(colnames(mat_sub), "_", Inf, T)[,2],
+                              col = list("ECM subtype" = palette_ECM_subtype),
+                              simple_anno_size = unit(.2, "cm"),
+                              show_annotation_name = F)
+
+ht = Heatmap(mat_sub,
+             name = "Scaled logCPM",
+        column_split = factor(str_split(colnames(mat_sub), "_", Inf, T)[,1], levels = c("s-Mac1", "s-Mac2", "DC", "MDSC", "Prolif.", "AP-Mic", "iMic", "h-Mic")),
+        col = colorRamp2(seq(-2.5, 2.5, length.out=11), rev(brewer.pal(n=11, name="RdBu"))),
+        #row_split = m_markers[rownames(mat_sub),]$Phenotype,
+        show_column_names = F,
+        cluster_column_slices = F,
+        top_annotation = column_ha,
+        width = unit(6, "cm"),
+        height = unit(2.5, "cm"),
+        column_title_rot = 90,
+        show_row_dend = F,
+        show_column_dend = F)
+
+ht
+```
+
+```{r}
+pdf(paste0("H:/TIMElab/figures/FIG3/", "myeloid_MHC.pdf"), width = 10, height = 7)
+draw(ht)
+dev.off()
+```
+
+
+I think that plotting boxplots would be better
+
+
+#### Marker genes
+
+```{r}
+mc_markers = c("ITGAM", "ITGAX", "CD14", "CD33", "CD68", "MSR1", "HLA-DRB1", "CD74", "B2M", "IFNGR1", "CD1C", "S100A4", "MIF", "LYZ", "CX3CR1", "TMEM119", "P2RY12", "BHLHE41", "SPRY1", "CCL4", "CCL3", "ITGA4", "IL1B", "IL6", "IL12A", "IL23A", "CXCL9", "NFKBIZ", "NOS2", "CD80", "CD86", "TNF", "MRC1", "IL1R1", "CCL17", "TGFB1", "IGF1", "FN1", "CCL1", "IL10", "TNFSF14", "MERTK", "CXCL13", "CD163", "VEGFA", "MKI67")
+DefaultAssay(seurat_obj_sub) <- "RNA"
+seurat_obj_sub = ScaleData(seurat_obj_sub)
+p = DotPlot(seurat_obj_sub,
+        features = mc_markers,
+        cluster.idents = T) + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+p
+```
+
+
+
+
+```{r}
+Idents(seurat_obj_sub) <- "integrated_snn_res.0.3"
+seurat_obj_sub <- RenameIdents(object = seurat_obj_sub, 
+                              "0" = "iMic",
+                              "1" = "iMic",
+                              "2" = "h-Mic",
+                              "3" = "MDSC",
+                              "4" = "s-Mac1",
+                              "5" = "s-Mac1",
+                              "6" = "s-Mac2",
+                              "7" = "DC",
+                              "8" = "Prolif.",
+                           "9" = "AP-Mic",
+                           "10" = "Prolif.",
+                           "11" = "s-Mac1")
+seurat_obj_sub$cell.type.fine = Idents(seurat_obj_sub)
+DimPlot(seurat_obj_sub, label = TRUE)
+```
+
+```{r}
+Idents(seurat_obj_sub) <- "integrated_snn_res.0.3"
+seurat_obj_sub <- RenameIdents(object = seurat_obj_sub, 
+                              "0" = "Mic",
+                              "1" = "Mic",
+                              "2" = "Mic",
+                              "3" = "MDSC",
+                              "4" = "Mac",
+                              "5" = "Mac",
+                              "6" = "Mac",
+                              "7" = "DC",
+                              "8" = "Mac",
+                           "9" = "Mic",
+                           "10" = "Mac",
+                           "11" = "Mac")
+seurat_obj_sub$cell.type = Idents(seurat_obj_sub)
+DimPlot(seurat_obj_sub, label = TRUE)
+```
+
+```{r}
+Idents(seurat_obj_sub) <- "integrated_snn_res.0.3"
+seurat_obj_sub <- RenameIdents(object = seurat_obj_sub, 
+                              "0" = "Mic",
+                              "1" = "Mic",
+                              "2" = "Mic",
+                              "3" = "MDSC",
+                              "4" = "Mac",
+                              "5" = "Mac",
+                              "6" = "Mac",
+                              "7" = "DC",
+                              "8" = "Prolif. Mac",
+                           "9" = "Mic",
+                           "10" = "Prolif. Mac",
+                           "11" = "Mac")
+seurat_obj_sub$cell.type.prolif = Idents(seurat_obj_sub)
+p = DimPlot(seurat_obj_sub, label = TRUE)
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures/", filename= "myeloid_umap.pdf", width=5.2, height=4)
+```
+
+
+```{r}
+write_tsv(seurat_obj_sub@meta.data %>%
+  rownames_to_column("Cell") %>%
+  dplyr::select(Cell, cell.type.fine),
+  "F:/TIMElab/GSE182109_processed/cell_anno/myeloid.tsv")
+```
+
+
+
+#### Matrisome expression
+
+```{r}
+matrisome_d = readxl::read_xlsx("F:/TIMElab/bulk_RNAseq/matrisome_hs_masterlist.xlsx")
+core_matrisome_d = matrisome_d %>% filter(Division=="Core matrisome")
+core_matrisome_d = core_matrisome_d[core_matrisome_d$`Gene Symbol`%in%rownames(seurat_obj_sub),]
+```
+
+Courtesy of raveancic
+```{r}
+PrctCellExpringGene <- function(object, genes, group.by = "all"){
+    if(group.by == "all"){
+        prct = unlist(lapply(genes,calc_helper, object=object))
+        result = data.frame(Markers = genes, Cell_proportion = prct)
+        return(result)
+    }
+
+    else{        
+        list = SplitObject(object, group.by)
+        factors = names(list)
+
+        results = lapply(list, PrctCellExpringGene, genes=genes)
+        for(i in 1:length(factors)){
+        results[[i]]$Feature = factors[i]
+        }
+        combined = do.call("rbind", results)
+        return(combined)
+    }
+}
+
+calc_helper <- function(object,genes){
+    counts = object[['RNA']]@counts
+    ncells = ncol(counts)
+    if(genes %in% row.names(counts)){
+    sum(counts[genes,]>0)/ncells
+    }else{return(NA)}
+}
+```
+
+```{r}
+prct_expressed = PrctCellExpringGene(seurat_obj_sub, core_matrisome_d$`Gene Symbol`, group.by = "cell.type")
+rownames(prct_expressed) = 1:nrow(prct_expressed)
+```
+
+```{r}
+highly_expressed = unique(prct_expressed$Markers[prct_expressed$Cell_proportion>.5])
+```
+
+
+```{r}
+p = DoHeatmap(seurat_obj_sub, features = c(core_matrisome_d$`Gene Symbol`, cc.genes$g2m.genes), size = 7, raster = TRUE) + scale_fill_gradientn(colors = rev(colorRampPalette(RColorBrewer::brewer.pal(11,"RdBu"))(256)), )
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures/", filename= "myeloid_ECM_legend.pdf", width=7, height=8)
+```
+
+Violin plot: ECM ploteins
+
+```{r}
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+
+## remove the x-axis text and tick
+## plot.margin to adjust the white space between each plot.
+## ... pass any arguments to VlnPlot in Seurat
+modify_vlnplot<- function(obj, 
+                          feature, 
+                          pt.size = 0, 
+                          split.by_feature,
+                          plot.margin = unit(c(-0.75, 0, -0.75, 0), "cm"),
+                          ...) {
+  p<- VlnPlot(obj, features = feature,  pt.size = pt.size, ... )  + 
+    xlab("") + ylab(feature) + ggtitle("") + 
+    theme(legend.position = "none", 
+          axis.text.x = element_blank(), 
+          axis.ticks.x = element_blank(), 
+          plot.title= element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_text(size = rel(1), angle = 0), 
+          axis.text.y = element_text(size = rel(1)), 
+          plot.margin = plot.margin ) 
+  return(p)
+}
+
+## extract the max value of the y axis
+extract_max<- function(p){
+  ymax<- max(ggplot_build(p)$layout$panel_scales_y[[1]]$range$range)
+  return(ceiling(ymax))
+}
+
+
+## main function
+StackedVlnPlot<- function(obj, features,
+                          pt.size = 0, 
+                          plot.margin = unit(c(-0.75, 0, -0.75, 0), "cm"),
+                          ...) {
+  
+  plot_list<- purrr::map(features, function(x) modify_vlnplot(obj = obj,feature = x, ...))
+  
+  # Add back x-axis title to bottom plot. patchwork is going to support this?
+  plot_list[[length(plot_list)]]<- plot_list[[length(plot_list)]] +
+    theme(axis.text.x=element_text(angle = 90, vjust = 0.5, hjust=1), axis.ticks.x = element_line())
+  
+  # change the y-axis tick to only max value 
+  ymaxs<- purrr::map_dbl(plot_list, extract_max)
+  plot_list<- purrr::map2(plot_list, ymaxs, function(x,y) x + 
+                            scale_y_continuous(breaks = c(y)) + 
+                            expand_limits(y = y))
+
+  p<- patchwork::wrap_plots(plotlist = plot_list, ncol = 1)
+  return(p)
+}
+```
+
+```{r}
+DefaultAssay(seurat_obj_sub) = "RNA"
+features_to_plot = highly_expressed
+
+p = StackedVlnPlot(obj = seurat_obj_sub, features = features_to_plot,
+                   plot.margin = unit(c(-0.85, 0, -0.85, 0)))
+
+p
+
+ggsave(p, path="F:/TIMElab/figures/", filename= "ecm_vln.pdf", width=4, height=4, dpi=700)
+```
+
+
+
+Proliferation markers
+
+```{r}
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+
+## remove the x-axis text and tick
+## plot.margin to adjust the white space between each plot.
+## ... pass any arguments to VlnPlot in Seurat
+modify_vlnplot<- function(obj, 
+                          feature, 
+                          pt.size = 0, 
+                          split.by_feature,
+                          plot.margin = unit(c(-0.75, 0, -0.75, 0), "cm"),
+                          ...) {
+  p<- VlnPlot(obj, features = feature, cols = palette_ECM_subtype, split.by = split.by_feature,  pt.size = pt.size, ... )  + 
+    xlab("") + ylab(feature) + ggtitle("") + 
+    theme(legend.position = "none", 
+          axis.text.x = element_blank(), 
+          axis.ticks.x = element_blank(), 
+          plot.title= element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_text(size = rel(1), angle = 0), 
+          axis.text.y = element_text(size = rel(1)), 
+          plot.margin = plot.margin ) 
+  return(p)
+}
+
+## extract the max value of the y axis
+extract_max<- function(p){
+  ymax<- max(ggplot_build(p)$layout$panel_scales_y[[1]]$range$range)
+  return(ceiling(ymax))
+}
+
+
+## main function
+StackedVlnPlot<- function(obj, features,
+                          pt.size = 0, 
+                          plot.margin = unit(c(-0.75, 0, -0.75, 0), "cm"),
+                          ...) {
+  
+  plot_list<- purrr::map(features, function(x) modify_vlnplot(obj = obj,feature = x, ...))
+  
+  # Add back x-axis title to bottom plot. patchwork is going to support this?
+  plot_list[[length(plot_list)]]<- plot_list[[length(plot_list)]] +
+    theme(axis.text.x=element_text(angle = 90, vjust = 0.5, hjust=1), axis.ticks.x = element_line())
+  
+  # change the y-axis tick to only max value 
+  ymaxs<- purrr::map_dbl(plot_list, extract_max)
+  plot_list<- purrr::map2(plot_list, ymaxs, function(x,y) x + 
+                            scale_y_continuous(breaks = c(y)) + 
+                            expand_limits(y = y))
+
+  p<- patchwork::wrap_plots(plotlist = plot_list, ncol = 1)
+  return(p)
+}
+```
+
+```{r}
+DefaultAssay(seurat_obj_sub) = "RNA"
+features_to_plot = c("CDK1", "TOP2A", "MKI67", "CDCA3", "KIF2C", "CENPE", "CENPA")
+
+p = StackedVlnPlot(obj = seurat_obj_sub, features = features_to_plot,
+                   split.by_feature = "ECM.cluster",
+                   plot.margin = unit(c(-0.85, 0, -0.85, 0)))
+
+p
+
+ggsave(p, path="C:/Users/mzarodn2/Documents", filename= "CXCL_expression.pdf", width=6, height=6, dpi=700)
+```
+
+
+
+
+```{r}
+features_to_plot = c("CDK1", "TOP2A", "MKI67", "KIF2C", "CENPE", "CENPA")
+
+DefaultAssay(seurat_obj_sub) = "RNA"
+p = FeaturePlot(seurat_obj_sub, features = features_to_plot)
+p
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures/", filename= "myeloid_umap_GeX.pdf", width=8, height=10)
+```
+
+
+
+
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures/", filename= "myeloid_ECM.pdf", width=7, height=8, dpi=700)
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures/", filename= "myeloid_ECM_ybp.pdf", width=7, height=8, dpi=700)
+```
+
+```{r}
+p = DotPlot(
+  seurat_obj_sub, cluster.idents = T,
+  scale = F,
+  features = core_matrisome_d[core_matrisome_d$`Gene Symbol`%in%highly_expressed,]$`Gene Symbol`
+) + coord_flip() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + scale_colour_gradient2(low = "#3C5488FF", mid = "grey", high = "#DC0000FF")
+p
+```
+
+#### Prolif vs Nonprolif
+
+```{r}
+Idents(seurat_obj_sub) = "cell.type.prolif"
+markers1 <- FindMarkers(seurat_obj_sub, ident.1 = "Prolif. Mac", ident.2 = "Mac", min.pct = 0.25, logfc.threshold = 1, only.pos = TRUE)
+markers2 <- FindMarkers(seurat_obj_sub, ident.1 = "Mac", ident.2 = "Prolif. Mac", min.pct = 0.25, logfc.threshold = 1, only.pos = TRUE)
+```
+
+
+```{r}
+genes_to_plot = c(rownames(markers1)[1:10], rownames(markers2)[1:10])
+
+p = DoHeatmap(seurat_obj_sub, features = genes_to_plot, cells = seurat_obj_sub@meta.data %>% filter(cell.type == "Mac") %>% rownames_to_column("cell") %>% group_by(cell.type.prolif) %>% slice_sample(n = 1000) %>% pull(cell)) + scale_fill_gradientn(colors = rev(colorRampPalette(RColorBrewer::brewer.pal(11,"RdBu"))(256)), )
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures/", filename= "myeloid_prolif_markers.pdf", width=5, height=4)
+```
+
+
+#### Gene markers
+
+```{r}
+DefaultAssay(seurat_obj_sub) <- "RNA"
+p = DotPlot(seurat_obj_sub,
+        features = mc_markers,
+        cluster.idents = T) + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+p
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures", filename= "markers_myeloid.pdf", width=12, height=4.3, dpi=700)
+```
+
+
+#### Cell state frequency
+
+```{r, eval=F}
+library(ggpubr)
+library(rstatix)
+library(cowplot)
+library(tidyverse)
+
+freq_d = seurat_obj_sub@meta.data %>%
+  dplyr::filter(ECM.cluster == "ECMlo" | ECM.cluster == "ECMhi") %>%
+  group_by(seq_folder, ECM.cluster, cell.type.fine) %>%
+  summarise(Count = n()) %>%
+  mutate(Prop = Count/sum(Count))
+
+stat.test <- freq_d %>%
+  group_by(cell.type.fine) %>%
+  t_test(Prop ~ ECM.cluster) %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(p.adj = signif(p.adj, 3), y.position = y.position + .2)
+
+
+p = ggviolin(freq_d,
+          x = "ECM.cluster",
+          y = "Prop",
+          add = c("boxplot", "jitter"),
+          color = "ECM.cluster",
+          palette = palette_ECM_subtype,
+          #facet.by = "Cluster",
+          outlier.shape = NA,
+          width = 0.6) +
+  #geom_dotplot(aes(fill = Cluster, color = Cluster), binaxis='y', stackdir='center', dotsize=.4) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="Frequency") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(legend.position = "none") +
+  ylim(0, 1.3) +
+  xlab(NULL)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.5
+p = facet(p, "cell.type.fine", nrow = 1)
+p
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures", filename= "myeloid_violin.pdf", width=7.2, height=3, dpi=700)
+```
+
+
+
+#### MiloR
+
+Prepare the data and the env
+```{r}
+library(miloR)
+library(SingleCellExperiment)
+library(scater)
+library(dplyr)
+library(Seurat)
+library(patchwork)
+
+seurat_obj_sub = seurat_obj_sub[,seurat_obj_sub $ECM.cluster!="undefined"]
+DefaultAssay(seurat_obj_sub) <- "RNA"
+
+seurat_sce <- as.SingleCellExperiment(seurat_obj_sub)
+seurat_sce <- swapAltExp(seurat_sce, "integrated")
+seurat_milo <- Milo(seurat_sce)
+reducedDim(seurat_milo, "UMAP") <- reducedDim(seurat_sce, "UMAP")
+rm(seurat_sce)
+```
+
+```{r}
+seurat_milo <- buildGraph(seurat_milo, k = 24, d = 30)
+seurat_milo <- makeNhoods(seurat_milo, prop = .1, k = 24, d=30, refined = TRUE)
+plotNhoodSizeHist(seurat_milo)
+```
+
+
+Counting cells in neighborhoods
+```{r}
+seurat_milo <- countCells(seurat_milo, meta.data = data.frame(colData(seurat_milo)), sample="seq_folder")
+```
+
+DA testing
+```{r}
+traj_design <- data.frame(colData(seurat_milo))[,c("seq_folder", "ECM.cluster")]
+traj_design <- distinct(traj_design)
+rownames(traj_design) <- traj_design$seq_folder
+traj_design$ECM.cluster <- factor(traj_design$ECM.cluster)
+traj_design$ECM.cluster <- relevel(traj_design$ECM.cluster, "ECMlo")
+```
+
+Cydar package introduces spatial FDR correction which accounts for overlaps between neighborhoods. It was initially developed for mass cytometry data. It weights each hypothesis P-value by the reciprocal (1/x) of the kth nearest neighbor distance.
+```{r}
+da_results_1 <- testNhoods(seurat_milo, design = ~ ECM.cluster, design.df = traj_design, fdr.weighting="graph-overlap")
+da_results_1 %>%
+  filter(FDR < 0.05)
+```
+
+```{r}
+library(scales)
+seurat_milo <- buildNhoodGraph(seurat_milo)
+col <- scale_fill_gradient2(low = muted("blue"),
+                            mid = "white",
+                            high = muted("red"),
+                            midpoint = 0)
+p1 <- plotNhoodGraphDA(seurat_milo, da_results_1, alpha=0.05) + col + labs(fill = "logFC")
+```
+MiloR plot
+```{r, eval=F}
+ggsave(p1, path="H:/TIMElab/figures/FIG3", filename= "miloR_myeloid.pdf", width=9*.7, height=7*.7, dpi=700)
+```
+
+UMAP plot
+```{r, eval=F}
+p = DimPlot(seurat_obj_sub, label = T, group.by = "cell.type.fine", label.size = 6, cols = RColorBrewer::brewer.pal(8,"Dark2")) + theme_void()
+ggsave(p, path="F:/TIMElab/figures/FIG3", filename= "umap_myeloid.pdf", width=8*.6, height=7*.6, dpi=700)
+```
+
+Split by ECM subtype
+```{r}
+p = DimPlot(seurat_obj_sub,  group.by = "ECM.cluster", split.by = "ECM.cluster", cols = palette_ECM_subtype, ncol = 1) + theme_void()
+ggsave(p, path="H:/TIMElab/figures/FIG3", filename= "umap_ECM_subtype.pdf", width=4.5*1.2, height=7*1.2, dpi=700)
+```
+
+
+
+```{r}
+da_results_1 <- annotateNhoods(seurat_milo, da_results_1, coldata_col = "cell.type.fine")
+
+library(scales)
+col <- scale_color_gradient2(low = muted("blue"),
+                            mid = "white",
+                            high = muted("red"),
+                            midpoint = 0)
+
+p = plotDAbeeswarm(da_results_1, group.by = "cell.type.fine") + col
+p
+```
+
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures/FIG3", filename= "miloR_myeloid_beeswarm.pdf", width=9*.6, height=7*.7, dpi=700)
+saveRDS(p, "F:/TIMElab/figures/FIG3/miloR_myeloid_beeswarm.rds")
+```
+
+
+
+#### DE testing
+
+```{r}
+do_pseudobulk <- function(seurat_object) {
+  #de.results <- do_pseudobulk(merged_seurat)
+  library(scran)
+  library(scuttle)
+  library(edgeR)
+  library(Seurat)
+  library(tidyverse)
+  
+  DefaultAssay(seurat_object) <- "RNA"
+  merged_sce <- as.SingleCellExperiment(DietSeurat(seurat_object))
+  merged_sce@assays@data$logcounts <- NULL
+  summed <- scuttle::aggregateAcrossCells(merged_sce, 
+                                 id=colData(merged_sce)[,c("cell.type.fine", "seq_folder", "patient")],
+                                 use.assay.type = 1)
+  summed.filt <- summed[,summed$ncells >= 10]
+  de.results <- pseudoBulkDGE(summed.filt, 
+                              label=summed.filt$cell.type.fine,
+                              design=~factor(ECM.cluster)+factor(patient),
+                              coef="factor(ECM.cluster)ECMlo",
+                              condition=summed.filt$ECM.cluster)
+  return(de.results)
+}
+
+find_specific_DE <- function(cluster_name) {
+  # Finds genes that are DE in a specific cluster but not others
+  
+  is.de <- decideTestsPerLabel(de.results, threshold=0.05)
+  
+  # Finding all genes that are not remotely DE in all other labels.
+  remotely.de <- decideTestsPerLabel(de.results, threshold=0.5)
+  not.de <- remotely.de==0 | is.na(remotely.de)
+  not.de.other <- rowMeans(not.de[,colnames(not.de)!=cluster_name])==1
+  
+  # Intersecting with genes that are DE inthe B cells
+  unique.degs <- is.de[,cluster_name]!=0 & not.de.other
+  unique.degs <- names(which(unique.degs))
+  
+  if (length(unique.degs) == 0) {
+    return(NULL)
+  } else {
+    # Inspecting the results.
+    de.allantois <- de.results[[cluster_name]]
+    de.allantois <- de.allantois[unique.degs,]
+    de.allantois <- de.allantois[order(de.allantois$PValue),]
+    de.allantois <- as.data.frame(de.allantois) %>% mutate(Identity = cluster_name)
+    return(de.allantois %>% rownames_to_column("Gene.name")) 
+  }
+}
+
+load_gene_annotations <- function() {
+  library("AnnotationHub")
+  # Connect to AnnotationHub
+  ah <- AnnotationHub()
+  
+  # Access the Ensembl database for organism
+  ahDb <- query(ah, 
+                pattern = c("Homo sapiens", "EnsDb"), 
+                ignore.case = TRUE)
+  
+  # Acquire the latest annotation files
+  id <- ahDb %>%
+    mcols() %>%
+    rownames() %>%
+    tail(n = 1)
+  
+  # Download the appropriate Ensembldb database
+  edb <- ah[[id]]
+  
+  # Extract gene-level information from database
+  annotations <- genes(edb, 
+                       return.type = "data.frame")
+  
+  # Select annotations of interest
+  annotations <- annotations %>%
+    dplyr::select(gene_id, gene_name, seq_name, gene_biotype, description)
+  
+  return(annotations)
+}
+
+write_de_results <- function(pseudobulk_out) {
+  # Formats the output as a nice table
+  #to_write <- write_de_results(de.results)
+  merged_df = data.frame()
+  for (i in names(pseudobulk_out)) {
+    merged_df_sub <- as.data.frame(pseudobulk_out[[i]]) %>%
+      #dplyr::filter(FDR < 0.05) %>%
+      mutate(Cell.type = i) %>%
+      arrange(FDR) %>%
+      drop_na() %>%
+      rownames_to_column("Gene.name")
+    
+    merged_df <- rbind(merged_df, merged_df_sub)
+  }
+  merged_df <- merged_df  %>%
+    left_join(y = unique(annotations[, c("gene_name", "description")]),
+              by = c("Gene.name" = "gene_name"))
+  return(merged_df)
+}
+```
+
+```{r}
+de.results <- do_pseudobulk(seurat_obj_sub[,seurat_obj_sub$ECM.cluster%in%c("ECMlo", "ECMhi")])
+de.specific <- map_dfr(names(de.results), find_specific_DE)
+
+# Up- or downregulated across most cell types.
+is.de <- decideTestsPerLabel(de.results, threshold=0.05)
+up.de <- is.de > 0 & !is.na(is.de)
+up.de <- sort(rowMeans(up.de), decreasing=TRUE)
+up.de <- data.frame(Percentage_CL = up.de[up.de > 0])
+
+down.de <- is.de < 0 & !is.na(is.de)
+down.de <- sort(rowMeans(down.de), decreasing=TRUE)
+down.de <- data.frame(Percentage_CL = down.de[down.de > 0])
+```
+
+```{r, eval=F}
+out_dir = "F:/TIMElab/GSE182109_processed/DE/myeloid/"
+write.table(up.de, file= paste0(out_dir, "/up_DE_percentage_clusters.tsv"), quote=F, row.names=T, sep="\t")
+write.table(down.de, file= paste0(out_dir, "/down_DE_percentage_clusters.tsv"), quote=F, row.names=T, sep="\t")
+write.table(write_de_results(de.results), file= paste0(out_dir, "/DE_results.tsv"), quote=F, row.names=F, sep="\t")
+write.table(de.specific, file= paste0(out_dir, "/DE_results_CL-specific.tsv"), quote=F, row.names=F, sep="\t")
+```
+
+
+#### GSEA
+
+```{r}
+de.results = read_tsv("H:/TIMElab/GSE182109_processed/DE/myeloid/DE_results.tsv")
+```
+
+
+```{r}
+library(clusterProfiler)
+library(ReactomePA)
+```
+
+```{r}
+x = de.results_list[[7]]
+
+ids = bitr(x$Gene.name, 
+            fromType = "SYMBOL", 
+            toType = c("ENTREZID"), 
+            OrgDb = "org.Hs.eg.db")
+
+keep = which(duplicated(ids$ENTREZID) == FALSE)
+ids = ids[keep,]
+ids = ids %>%
+  left_join(
+    x, c("SYMBOL"="Gene.name")
+  )
+foldchanges = ids$logFC
+names(foldchanges) = ids$ENTREZID
+foldchanges = sort(foldchanges, decreasing = TRUE)
+
+gsePathway_result = gsePathway(geneList = foldchanges,
+              pvalueCutoff = .05,
+              verbose = F)
+
+saveRDS(gseGO_CGGA325, "F:/TIMElab/bulk_RNAseq/gsea/CGGA325.rds")
+gsePathway_result_table = gsePathway_result @result
+
+View(gsePathway_result_table)
+```
+
+
+```{r}
+reactome_CP <- function(x) {
+  library(clusterProfiler)
+  library(ReactomePA)
+  
+  ids = bitr(x$Gene.name, 
+              fromType = "SYMBOL", 
+              toType = c("ENTREZID"), 
+              OrgDb = "org.Hs.eg.db")
+  keep = which(duplicated(ids$ENTREZID) == FALSE)
+  ids = ids[keep,]
+  ids = ids %>%
+    left_join(
+      x, c("SYMBOL"="Gene.name")
+    )
+  foldchanges = ids$logFC
+  names(foldchanges) = ids$ENTREZID
+  foldchanges = sort(foldchanges, decreasing = TRUE)
+  
+  gsePathway_result = gsePathway(geneList = foldchanges,
+                pvalueCutoff = .05,
+                verbose = F)
+  gsePathway_result_table = gsePathway_result@result
+  return(gsePathway_result_table)
+}
+
+
+de.results_list = group_split(de.results, Cell.type) %>% as.list(de.results)
+names(de.results_list) = unique(de.results$Cell.type)
+reactome_CP_out = lapply(de.results_list, reactome_CP)
+names(reactome_CP_out) = names(de.results_list)
+reactome_CP_out_df = bind_rows(reactome_CP_out, .id = "Cell.type")
+
+write_tsv(reactome_CP_out_df, "H:/TIMElab/GSE182109_processed/DE/myeloid/ReactomePA.tsv")
+```
+
+
+Functional analysis
+
+GO enrichment
+```{r}
+source("util.R")
+run_clusterProfiler_by_celltype(
+  paste0(out_dir, "/DE_results.tsv"),
+  "F:/TIMElab/GSE182109_processed/DE/tcells/functional/GO"
+)
+```
+
+## Pericytes
+
+```{r}
+gc()
+seurat_obj = readRDS("F:/TIMElab/GSE182109_processed/seurat_obj.rds")
+DefaultAssay(seurat_obj) = "RNA"
+sce_obj = as.SingleCellExperiment(DietSeurat(seurat_obj))
+rm(seurat_obj)
+```
+
+
+
+### MUSIC
+
+Mural cells and endothelial cells
+
+TCGA
+
+```{r}
+library(SummarizedExperiment)
+library(dplyr)
+library(ggpubr)
+library(rstatix)
+library(cowplot)
+library(MuSiC)
+palette_ECM_subtype = c("ECMhi" = "#E64B35FF", "ECMlo" = "#4DBBD5FF")
+
+bulk_data = readRDS("F:/TIMElab/bulk_RNAseq/TCGA-CGGA-COUNTS-SummarizedExperiment.rds")
+
+music_result = music_prop(bulk.mtx = assay(bulk_data)[,bulk_data$Batch=="TCGA"], sc.sce = sce_obj, clusters = 'cell.type',
+                               samples = 'seq_folder', select.ct = c("Pericyte", "Endothelial"), verbose = F)
+
+music_result_df = music_result$Est.prop.weighted %>%
+  as.data.frame()
+
+music_result_df$ECM.cluster = colData(bulk_data)[bulk_data$Batch=="TCGA",]$ECM.cluster
+
+music_result_df = music_result_df %>%
+  rownames_to_column("Sample") %>%
+  pivot_longer(!c(Sample, ECM.cluster), names_to = "Cluster", values_to = "Prop") 
+
+stat.test <- music_result_df %>%
+  group_by(Cluster) %>%
+  t_test(Prop ~ ECM.cluster) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(y.position = y.position+.2) %>%
+  arrange(p.adj)
+
+p = ggviolin(music_result_df,
+          x = "ECM.cluster",
+          y = "Prop",
+          add = c("boxplot", "jitter"),
+          color = "ECM.cluster",
+          palette = palette_ECM_subtype,
+          #facet.by = "Cluster",
+          outlier.shape = NA,
+          width = 0.6) +
+  #geom_dotplot(aes(fill = Cluster, color = Cluster), binaxis='y', stackdir='center', dotsize=.4) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="MuSiC estimated proportion") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(legend.position = "none") +
+  xlab(NULL) +
+  ylim(0, 1.5)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.5
+p = facet(p, "Cluster", nrow = 1)
+p
+```
+```{r}
+ggsave(p, path="F:/TIMElab/figures/pericytes", filename= "music_deconv_mural.pdf", width=4, height=3, dpi=700)
+```
+
+CGGA
+
+```{r}
+music_result = music_prop(bulk.mtx = assay(bulk_data)[,bulk_data$Batch!="TCGA"], sc.sce = sce_obj, clusters = 'cell.type',
+                               samples = 'seq_folder', select.ct = c("Pericyte", "Endothelial"), verbose = F)
+
+music_result_df = music_result$Est.prop.weighted %>%
+  as.data.frame()
+
+music_result_df$ECM.cluster = colData(bulk_data)[bulk_data$Batch!="TCGA",]$ECM.cluster
+
+music_result_df = music_result_df %>%
+  rownames_to_column("Sample") %>%
+  pivot_longer(!c(Sample, ECM.cluster), names_to = "Cluster", values_to = "Prop") 
+
+stat.test <- music_result_df %>%
+  group_by(Cluster) %>%
+  t_test(Prop ~ ECM.cluster) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(y.position = y.position+.2) %>%
+  arrange(p.adj)
+
+p = ggviolin(music_result_df,
+          x = "ECM.cluster",
+          y = "Prop",
+          add = c("boxplot", "jitter"),
+          color = "ECM.cluster",
+          palette = palette_ECM_subtype,
+          #facet.by = "Cluster",
+          outlier.shape = NA,
+          width = 0.6) +
+  #geom_dotplot(aes(fill = Cluster, color = Cluster), binaxis='y', stackdir='center', dotsize=.4) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="MuSiC estimated proportion") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(legend.position = "none") +
+  xlab(NULL) +
+  ylim(0, 1.5)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.5
+p = facet(p, "Cluster", nrow = 1)
+p
+```
+
+
+
+FB-like cells
+
+```{r}
+library(SummarizedExperiment)
+library(dplyr)
+library(ggpubr)
+library(rstatix)
+library(cowplot)
+library(MuSiC)
+palette_ECM_subtype = c("ECMhi" = "#E64B35FF", "ECMlo" = "#4DBBD5FF")
+
+bulk_data = readRDS("F:/TIMElab/bulk_RNAseq/TCGA-CGGA-COUNTS-SummarizedExperiment.rds")
+
+music_result = music_prop(bulk.mtx = assay(bulk_data), sc.sce = sce_obj, clusters = 'cell.type.fine',
+                               samples = 'seq_folder', select.ct = c("FB-like", "MES1", "MES2"), verbose = F)
+
+
+
+music_result_df = music_result$Est.prop.weighted %>%
+  as.data.frame()
+
+music_result_df$ECM.cluster = colData(bulk_data)$ECM.cluster
+
+music_result_df = music_result_df %>%
+  rownames_to_column("Sample") %>%
+  pivot_longer(!c(Sample, ECM.cluster), names_to = "Cluster", values_to = "Prop") 
+
+stat.test <- music_result_df %>%
+  group_by(Cluster) %>%
+  t_test(Prop ~ ECM.cluster) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(y.position = y.position+.2) %>%
+  arrange(p.adj)
+
+p = ggviolin(music_result_df,
+          x = "ECM.cluster",
+          y = "Prop",
+          add = c("boxplot", "jitter"),
+          color = "ECM.cluster",
+          palette = palette_ECM_subtype,
+          #facet.by = "Cluster",
+          outlier.shape = NA,
+          width = 0.6) +
+  #geom_dotplot(aes(fill = Cluster, color = Cluster), binaxis='y', stackdir='center', dotsize=.4) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="MuSiC estimated proportion") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(legend.position = "none") +
+  xlab(NULL) +
+  ylim(0, 1.5)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.5
+p = facet(p, "Cluster", nrow = 1)
+p
+```
+
+
+
+### Subclustering pericytes
+
+```{r}
+seurat_obj_sub = readRDS("F:/TIMElab/GSE182109_processed/muralcells.rds")
+```
+
+UMAP
+```{r}
+p = DimPlot(seurat_obj_sub, label = T, label.size = 8, label.box = F) + theme_void() + NoLegend()
+p
+```
+
+```{r, eval=F}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2/"
+ggsave(p, path=fig_path, filename= "mural_cells_cell_types.pdf", width=3.2, height=3, dpi = 700)
+```
+
+
+Split by ECM subtype
+```{r}
+seurat_obj_sub = seurat_obj_sub[,seurat_obj_sub$ECM.cluster!="undefined"]
+p = DimPlot(seurat_obj_sub,  group.by = "ECM.cluster", split.by = "ECM.cluster", cols = palette_ECM_subtype, ncol = 1) + theme_void()
+ggsave(p, path="F:/TIMElab/figures", filename= "umap_muralcell_ECM_subtype.pdf", width=4.5*.9, height=6*.9, dpi=700)
+```
+
+
+#### Matrisome expression
+
+```{r}
+matrisome_d = readxl::read_xlsx("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/matrisome_hs_masterlist.xlsx")
+core_matrisome_d = matrisome_d %>% filter(Division=="Core matrisome")
+core_matrisome_d = core_matrisome_d[core_matrisome_d$`Gene Symbol`%in%rownames(seurat_obj_sub),]
+```
+
+Courtesy of raveancic
+```{r}
+PrctCellExpringGene <- function(object, genes, group.by = "all"){
+    if(group.by == "all"){
+        prct = unlist(lapply(genes,calc_helper, object=object))
+        result = data.frame(Markers = genes, Cell_proportion = prct)
+        return(result)
+    }
+
+    else{        
+        list = SplitObject(object, group.by)
+        factors = names(list)
+
+        results = lapply(list, PrctCellExpringGene, genes=genes)
+        for(i in 1:length(factors)){
+        results[[i]]$Feature = factors[i]
+        }
+        combined = do.call("rbind", results)
+        return(combined)
+    }
+}
+
+calc_helper <- function(object,genes){
+    counts = object[['RNA']]@counts
+    ncells = ncol(counts)
+    if(genes %in% row.names(counts)){
+    sum(counts[genes,]>0)/ncells
+    }else{return(NA)}
+}
+```
+
+```{r}
+prct_expressed = PrctCellExpringGene(seurat_obj_sub, core_matrisome_d$`Gene Symbol`, group.by = "cell.type.fine")
+rownames(prct_expressed) = 1:nrow(prct_expressed)
+```
+
+
+```{r}
+highly_expressed = unique(prct_expressed$Markers[prct_expressed$Cell_proportion>.5])
+```
+
+
+```{r}
+p = DotPlot(
+  seurat_obj_sub, cluster.idents = T,
+  scale = F,
+  features = core_matrisome_d[core_matrisome_d$`Gene Symbol`%in%highly_expressed,]$`Gene Symbol`
+) + coord_flip() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + scale_colour_gradient2(low = "#3C5488FF", mid = "grey", high = "#DC0000FF")
+p
+```
+
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures/FIG2/", filename= "matrisome_expression_muralcells.pdf", width=5*.9, height=10.5*.9, dpi=700)
+```
+
+
+```{r}
+sigs = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+```
+
+```{r}
+p = DotPlot(
+  seurat_obj_sub, cluster.idents = T,
+  scale = F,
+  features = sigs$ECMhi
+) + coord_flip() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + scale_colour_gradient2(low = "#3C5488FF", mid = "grey", high = "#DC0000FF")
+p
+```
+
+
+#### Marker genes
+
+```{r}
+res = FindMarkers(seurat_obj, ident.1 = "Mural cell")
+res = res %>%
+   rownames_to_column("gene") %>%
+    left_join(y = distinct(annotations[, c("gene_name", "description")], gene_name, .keep_all=T),
+              by = c("gene" = "gene_name"))
+write_tsv(res, "F:/TIMElab/GSE182109_processed/muralcell/markers_Mural_vs_ALL.tsv")
+```
+
+
+```{r}
+Idents(seurat_obj) = "cell.type.fine"
+res = FindMarkers(seurat_obj,
+                  ident.1 = "M-FB",
+                  min.pct = 0.5,
+                  logfc.threshold = 1,
+                  only.pos = T)
+write.table(res, "F:/TIMElab/GSE182109_processed/muralcell/markers_M-FB_vs_ALL.tsv", sep="\t")
+
+
+Idents(seurat_obj) = "cell.type.fine"
+res = FindMarkers(seurat_obj,
+                  ident.1 = "P-FB",
+                  min.pct = 0.5,
+                  logfc.threshold = 1,
+                  only.pos = T)
+write.table(res, "F:/TIMElab/GSE182109_processed/muralcell/markers_P-FB_vs_ALL.tsv", sep="\t")
+
+
+Idents(seurat_obj) = "cell.type.fine"
+res = FindMarkers(seurat_obj,
+                  ident.1 = "PC",
+                  min.pct = 0.5,
+                  logfc.threshold = 1,
+                  only.pos = T)
+write.table(res, "F:/TIMElab/GSE182109_processed/muralcell/markers_PC_vs_ALL.tsv", sep="\t")
+
+
+Idents(seurat_obj) = "cell.type.fine"
+res = FindMarkers(seurat_obj,
+                  ident.1 = "SMC",
+                  min.pct = 0.5,
+                  logfc.threshold = 1,
+                  only.pos = T)
+write.table(res, "F:/TIMElab/GSE182109_processed/muralcell/markers_SMC_vs_ALL.tsv", sep="\t")
+```
+
+
+```{r}
+seurat_obj_sub = subset(seurat_obj, idents = "Mural cell")
+DefaultAssay(seurat_obj_sub) = "RNA"
+```
+
+```{r}
+DefaultAssay(seurat_obj_sub) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+seurat_obj_sub <- ScaleData(seurat_obj_sub, verbose = FALSE)
+seurat_obj_sub <- RunPCA(seurat_obj_sub, npcs = 30, verbose = FALSE)
+seurat_obj_sub <- RunUMAP(seurat_obj_sub, reduction = "pca", dims = 1:4)
+seurat_obj_sub <- FindNeighbors(seurat_obj_sub, reduction = "pca", dims = 1:7)
+seurat_obj_sub <- FindClusters(seurat_obj_sub, resolution = 0.1)
+```
+
+```{r}
+DimPlot(seurat_obj_sub)
+```
+
+
+
+
+
+
+
+```{r}
+seurat_obj_sub = seurat_obj_sub[,seurat_obj_sub$ECM.cluster!="undefined"]
+
+p1 = DimPlot(seurat_obj_sub)
+p2 = DimPlot(seurat_obj_sub, group.by = "diagnosis")
+p3 = DimPlot(seurat_obj_sub, group.by = "ECM.cluster")
+p4 = DimPlot(seurat_obj_sub, group.by = "integrated_snn_res.0.1", label=T, label.size = 5)
+
+p  = p1 + p2 + p3 + p4
+p
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures/pericytes", filename= "umap.pdf", width=8.7*.9, height=6.5*.9, dpi=700)
+```
+
+
+```{r}
+DefaultAssay(seurat_obj_sub) = "RNA"
+FeaturePlot(seurat_obj_sub, "POSTN")
+```
+
+#### ECM sigs
+
+```{r}
+sigs = readRDS("F:/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+```
+
+```{r}
+DefaultAssay(seurat_obj_sub) = "RNA"
+seurat_obj_sub = ScaleData(seurat_obj_sub)
+p = DotPlot(seurat_obj_sub[,seurat_obj_sub$ECM.cluster!="undefined"],
+         cluster.idents = F,
+         scale = F,
+        features = sigs$ECMhi) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+ggsave(p, path="F:/TIMElab/figures/pericytes", filename= "dot_plot_signature_genes.pdf", width=12, height=4, dpi=700)
+```
+
+
+
+#### Marker genes
+
+```{r}
+Idents(seurat_obj_sub) = "integrated_snn_res.0.1"
+res = FindAllMarkers(seurat_obj_sub, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+annotations <- load_gene_annotations()
+res = res %>%
+    left_join(y = distinct(annotations[, c("gene_name", "description")], gene_name, .keep_all=T),
+              by = c("gene" = "gene_name"))
+
+write_tsv(res, "F:/TIMElab/GSE182109_processed/muralcell/markers_Mural_subclusters.tsv")
+```
+
+
+```{r}
+res = read_tsv("F:/TIMElab/GSE182109_processed/muralcell/markers_Mural_subclusters.tsv")
+res_list = group_split(group_by(res, cluster)) %>% as.list()
+```
+
+
+
+Heatmap
+```{r}
+res %>%
+    group_by(cluster) %>%
+    top_n(n = 15, wt = avg_log2FC) -> top10
+
+DefaultAssay(seurat_obj_sub) = "RNA"
+Idents(seurat_obj_sub) = "integrated_snn_res.0.1"
+seurat_obj_sub = ScaleData(seurat_obj_sub)
+
+p = DoHeatmap(seurat_obj_sub, features = top10$gene, size = 10) + NoLegend() + scale_fill_gradientn(colors = rev(colorRampPalette(RColorBrewer::brewer.pal(11,"RdBu"))(256)))
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures/pericytes", filename= "pericyte_marker_heatmap.pdf", width=7, height=8, dpi=700)
+```
+
+
+#### GSEA
+
+
+```{r}
+library(clusterProfiler)
+library(ReactomePA)
+```
+
+```{r}
+x = res_list[[1]]
+
+ids = bitr(x$gene, 
+            fromType = "SYMBOL", 
+            toType = c("ENTREZID"), 
+            OrgDb = "org.Hs.eg.db")
+
+keep = which(duplicated(ids$ENTREZID) == FALSE)
+ids = ids[keep,]
+ids = ids %>%
+  left_join(
+    x, c("SYMBOL"="gene")
+  )
+foldchanges = ids$avg_log2FC
+names(foldchanges) = ids$ENTREZID
+foldchanges = sort(foldchanges, decreasing = TRUE)
+
+gsePathway_result = gsePathway(geneList = foldchanges,
+              pvalueCutoff = .5,
+              verbose = T)
+
+saveRDS(gseGO_CGGA325, "F:/TIMElab/bulk_RNAseq/gsea/CGGA325.rds")
+gsePathway_result_table = gsePathway_result @result
+```
+
+
+GO
+```{r}
+res = FindAllMarkers(seurat_obj_sub, only.pos = T, min.pct = 0.25, logfc.threshold = 0.25)
+res_list = group_split(group_by(res, cluster)) %>% as.list()
+names(res_list) = levels(res$cluster)
+
+source("util.R")
+lapply(names(res_list), function(x) {
+  d = res_list[[x]]
+  clusterProfiler_GO_quick(d$gene[d$avg_log2FC > 1 & d$p_val_adj<0.05],
+                         rownames(seurat_obj_sub),
+                         "F:/TIMElab/GSE182109_processed/pericytes",
+                         x)
+})
+
+```
+
+
+#### Betsholtz signatures
+
+```{r}
+seurat_obj_sub = readRDS("F:/TIMElab/GSE182109_processed/muralcells.rds")
+```
+
+
+```{r, eval=F}
+library(biomaRt)
+
+mouse = useMart("ensembl", dataset = "mmusculus_gene_ensembl", host = "https://dec2021.archive.ensembl.org/")
+human = useMart("ensembl", dataset = "hsapiens_gene_ensembl", host = "https://dec2021.archive.ensembl.org/")
+
+lds_result <- getLDS(attributes = c("external_gene_name"),
+                       mart = mouse,
+                       attributesL = c("hgnc_symbol"), 
+                       martL = human)
+
+write_tsv(lds_result, "F:/TIMElab/mouse_human_gene_mapping.tsv")
+```
+
+```{r}
+lds_result = read_tsv("F:/TIMElab/mouse_human_gene_mapping.tsv")
+
+betsholtz_FB = read_tsv("F:/TIMElab/GSE182109_processed/muralcell/betsholtz_FB_FC.tsv") %>%
+  left_join(distinct(lds_result, Gene.name, .keep_all=T), by = c("Symbol"="Gene.name")) %>%
+  drop_na(HGNC.symbol) %>%
+  filter(HGNC.symbol%in%rownames(seurat_obj_sub)) %>%
+  head(50) %>%
+  pull(HGNC.symbol)
+
+betsholtz_FB1 = read_tsv("F:/TIMElab/GSE182109_processed/muralcell/betsholtz_FB1_FC.tsv") %>%
+  left_join(distinct(lds_result, Gene.name, .keep_all=T), by = c("Symbol"="Gene.name")) %>%
+  drop_na(HGNC.symbol) %>%
+  filter(HGNC.symbol%in%rownames(seurat_obj_sub)) %>%
+  head(50) %>%
+  pull(HGNC.symbol)
+
+betsholtz_FB2 = read_tsv("F:/TIMElab/GSE182109_processed/muralcell/betsholtz_FB2_FC.tsv") %>%
+  left_join(distinct(lds_result, Gene.name, .keep_all=T), by = c("Symbol"="Gene.name")) %>%
+  drop_na(HGNC.symbol) %>%
+  filter(HGNC.symbol%in%rownames(seurat_obj_sub)) %>%
+  head(50) %>%
+  pull(HGNC.symbol)
+
+betsholtz_PC = read_tsv("F:/TIMElab/GSE182109_processed/muralcell/betsholtz_PC_FC.tsv") %>%
+  left_join(distinct(lds_result, Gene.name, .keep_all=T), by = c("Symbol"="Gene.name")) %>%
+  drop_na(HGNC.symbol) %>%
+  filter(HGNC.symbol%in%rownames(seurat_obj_sub)) %>%
+  head(50) %>%
+  pull(HGNC.symbol)
+
+betsholtz_SMC = read_tsv("F:/TIMElab/GSE182109_processed/muralcell/betsholtz_SMC_FC.tsv") %>%
+  left_join(distinct(lds_result, Gene.name, .keep_all=T), by = c("Symbol"="Gene.name")) %>%
+  drop_na(HGNC.symbol) %>%
+  filter(HGNC.symbol%in%rownames(seurat_obj_sub)) %>%
+  head(50) %>%
+  pull(HGNC.symbol)
+```
+
+
+```{r}
+betsholtz_scores = sig_scores = scrabble::score(
+  mat = as.matrix(seurat_obj_sub@assays$RNA@data),
+  groups = list("FB" = betsholtz_FB,
+     "FB1" = betsholtz_FB1,
+     "FB2" = betsholtz_FB2,
+     "PC" = betsholtz_PC,
+     "SMC" = betsholtz_SMC),
+  replace = T
+)
+```
+
+
+```{r}
+ha_color = scales::hue_pal()(4)
+names(ha_color) = levels(seurat_obj_sub$cell.type.fine)
+ha = HeatmapAnnotation(
+  "Cluster" = seurat_obj_sub$cell.type.fine,
+  col = list("Cluster" = ha_color),
+  show_legend = T,
+  simple_anno_size = unit(.3, "cm"),
+  show_annotation_name = F
+)
+
+ht = Heatmap(t(betsholtz_scores),
+        name = "Signature score",
+        col = colorRamp2(seq(-.75, .75, length.out=11), rev(brewer.pal(n=11, name="RdBu"))),
+        show_row_names = T,
+        show_column_names = F,
+        width = unit(6, "cm"),
+        cluster_column_slices = F,
+        height = unit(3, "cm"),
+        show_row_dend = F,
+        column_split = seurat_obj_sub$cell.type.fine,
+        top_annotation = ha,
+         column_title_rot = 90,
+        show_column_dend = F)
+ht
+```
+
+```{r}
+pdf(paste0("F:/TIMElab/figures/FIG2/Supplement/", "betsholtz_scores_mural.pdf"), width = 8, height = 8)
+draw(ht)
+dev.off()
+```
+
+
+#### Brain atlas signatures
+
+```{r}
+marker_genes = read.table("F:/TIMElab/GSE163577_processed/marker_genes.tsv", sep="\t")
+marker_genes$gene = rownames(marker_genes)
+marker_genes$cell.type = factor(marker_genes$cell.type)
+marker_genes = marker_genes %>% filter(gene %in% rownames(seurat_obj_sub))
+
+marker_genes_list = group_split(marker_genes, cell.type) %>% as.list()
+marker_genes_list = lapply(marker_genes_list, function(x) {x$gene})
+names(marker_genes_list) = levels(marker_genes$cell.type)
+```
+
+```{r}
+sig_scores = sig_scores = scrabble::score(
+  mat = as.matrix(seurat_obj_sub@assays$RNA@data),
+  groups = marker_genes_list
+)
+```
+
+```{r}
+ha_color = scales::hue_pal()(5)
+names(ha_color) = levels(seurat_obj_sub$integrated_snn_res.0.1)
+ha = HeatmapAnnotation(
+  "Cluster" = seurat_obj_sub$integrated_snn_res.0.1,
+  col = list("Cluster" = ha_color),
+  show_legend = T,
+  simple_anno_size = unit(.3, "cm"),
+  show_annotation_name = F
+)
+
+ht = Heatmap(t(sig_scores),
+        name = "Signature score",
+        col = colorRamp2(seq(-2, 2, length.out=11), rev(brewer.pal(n=11, name="RdBu"))),
+        show_row_names = T,
+        show_column_names = F,
+        width = unit(7, "cm"),
+        cluster_column_slices = F,
+        height = unit(3, "cm"),
+        show_row_dend = F,
+        column_split = seurat_obj_sub$integrated_snn_res.0.1,
+        top_annotation = ha,
+        show_column_dend = F)
+ht
+```
+
+```{r}
+seurat_obj_sub$mfib = sig_scores[,1]
+seurat_obj_sub$pfib = sig_scores[,3]
+
+p = FeaturePlot(seurat_obj_sub, "mfib", pt.size = .1, min.cutoff = "q1")
+p
+```
+
+```{r, eval=F}
+fig_path = "F:/TIMElab/figures/FIG2"
+ggsave(p, path=fig_path, filename= "pfib_signature.pdf", width=3.75, height=3, dpi = 700)
+```
+
+
+
+
+
+```{r, eval=F}
+p = FeaturePlot(seurat_obj_sub, c("COL1A1"), min.cutoff = "q10")
+fig_path = "F:/TIMElab/figures/FIG2"
+ggsave(p, path=fig_path, filename= "FBlike_FeaturePlot_COL1A1.pdf", width=3.75, height=3, dpi = 700)
+```
+
+```{r, eval=F}
+p = FeaturePlot(seurat_obj_sub, c("FAP"), min.cutoff = "q10")
+fig_path = "F:/TIMElab/figures/FIG2"
+ggsave(p, path=fig_path, filename= "FBlike_FeaturePlot_FAP.pdf", width=3.75, height=3, dpi = 700)
+```
+
+```{r, eval=F}
+p = FeaturePlot(seurat_obj_sub, c("PDGFRA"), min.cutoff = "q10")
+fig_path = "F:/TIMElab/figures/FIG2"
+ggsave(p, path=fig_path, filename= "FBlike_FeaturePlot_PDGFRA.pdf", width=3.75, height=3, dpi = 700)
+```
+
+```{r, eval=F}
+p = FeaturePlot(seurat_obj_sub, c("COL1A1"), min.cutoff = "q10")
+fig_path = "F:/TIMElab/figures/FIG2"
+ggsave(p, path=fig_path, filename= "FBlike_FeaturePlot_COL1A1.pdf", width=3.75, height=3, dpi = 700)
+```
+
+
+```{r}
+DefaultAssay(seurat_obj_sub) = "RNA"
+
+p = DotPlot(seurat_obj_sub,
+            features = c("COL1A1", "COL4A1", "FN1", "PDGFRA", "PDGFRB", "FAP", "ACTA2", "KCNMA1", "SLC4A4", "LAMA2", "FBLN1", "CTHRC1", "ISLR"),
+            cluster.idents = T) +
+  coord_flip() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2/"
+ggsave(p, path=fig_path, filename= "FBlike_DotPlot.pdf", width=4.2, height=4, dpi = 700)
+```
+
+
+
+
+#### SCIPAC results
+
+```{r}
+load("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/SCIPAC/SCIPAC_res.RData")
+```
+
+```{r}
+seurat_obj_sub@meta.data = seurat_obj_sub@meta.data %>%
+  rownames_to_column("cell_id") %>%
+  left_join(
+    SCIPAC.res %>% select(cell_id, Lambda.est,  Lambda.upper, Lambda.lower, sig, log.pval)
+  ) %>%
+  column_to_rownames("cell_id")
+```
+
+```{r}
+p = DimPlot(seurat_obj_sub,
+        group.by = "sig",
+        pt.size = 0.1,
+        cols = c("#E64B35FF", "#4DBBD5FF", "#ededed"),
+        raster.dpi =  c(512*2, 512*2))
+p
+```
+```{r, eval=F}
+fig_path = "F:/TIMElab/figures/FIG2"
+ggsave(p, path=fig_path, filename= "SCIPAC_sig_FBlike.pdf", width=4, height=3, dpi = 700)
+```
+
+
+MSC markers from https://bmcgenomics.biomedcentral.com/articles/10.1186/s12864-016-3230-0
+```{r}
+VlnPlot(seurat_obj_sub, c("ANPEP", "ITGA5", "NT5E", "THY1", "ENG", "MCAM", "PDGFRB"))
+```
+
+
+
+
+```{r}
+Idents(seurat_obj_sub) <- "integrated_snn_res.0.1"
+seurat_obj_sub <- RenameIdents(object = seurat_obj_sub, 
+                              "0" = "P-FB",
+                              "1" = "PC",
+                              "2" = "SMC",
+                              "3" = "M-FB",
+                              "4" = "M-FB")
+seurat_obj_sub$cell.type.fine = Idents(seurat_obj_sub)
+DimPlot(seurat_obj_sub, label = TRUE)
+```
+
+```{r}
+write_tsv(seurat_obj_sub@meta.data %>%
+  rownames_to_column("Cell") %>%
+  dplyr::select(Cell, cell.type.fine),
+  "F:/TIMElab/GSE182109_processed/cell_anno/muralcell.tsv")
+```
+
+
+```{r}
+saveRDS(seurat_obj_sub, "F:/TIMElab/GSE182109_processed/muralcells.rds")
+```
+
+
+
+#### Sample support
+
+By how many patients is cluster 0 supported?
+
+```{r}
+p1 = ggplot(data = seurat_obj_sub@meta.data, aes(x = integrated_snn_res.0.1, fill = sample)) + 
+  geom_histogram(colour = 'white', position = 'fill', stat = "count") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  cowplot::theme_cowplot(16) +
+  labs(x = NULL, y = "Fraction") +
+  theme(axis.text.x = element_blank())
+
+p2 = ggplot(data = seurat_obj_sub@meta.data, aes(x = integrated_snn_res.0.1, fill = patient)) + 
+  geom_histogram(colour = 'white', position = 'fill', stat = "count") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  cowplot::theme_cowplot(16) +
+  labs(x = "Cluster", y = "Fraction")
+
+p = cowplot::plot_grid(p1, p2, ncol = 1, align = 'v')
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures/pericytes/", filename= "mural_cell_subcluster_seq_folder.pdf", width=7, height=9, dpi=700)
+```
+
+
+```{r}
+p1 = ggplot(data = seurat_obj_sub@meta.data, aes(x = cell.type.fine, fill = sample)) + 
+  geom_histogram(colour = 'white', position = 'fill', stat = "count") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  cowplot::theme_cowplot(16) +
+  labs(x = NULL, y = "Fraction") +
+  theme(axis.text.x = element_blank())
+
+p2 = ggplot(data = seurat_obj_sub@meta.data, aes(x = cell.type.fine, fill = patient)) + 
+  geom_histogram(colour = 'white', position = 'fill', stat = "count") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  cowplot::theme_cowplot(16) +
+  labs(x = "Cluster", y = "Fraction")
+
+p = cowplot::plot_grid(p1, p2, ncol = 1, align = 'v')
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures/pericytes/", filename= "mural_cell_celltypefine_seq_folder.pdf", width=7, height=9, dpi=700)
+```
+
+
+In how many samples are FB-like cells detected?
+```{r}
+seurat_obj@meta.data %>% group_by(seq_folder, ECM.cluster, cell.type.fine) %>% summarise(Count = n()) %>% filter(ECM.cluster!="undefined") %>% filter(cell.type.fine == "FB-like", Count > 5) %>% group_by(ECM.cluster) %>% summarise(Count = n())
+```
+
+```{r}
+seurat_obj@meta.data %>% distinct(seq_folder, ECM.cluster) %>% group_by(ECM.cluster) %>% summarise(Count = n())
+```
+
+
+
+
+```{r}
+DefaultAssay(seurat_obj_sub) <- "RNA"
+p = VlnPlot(seurat_obj_sub,
+        group.by = "integrated_snn_res.0.1",
+            c("MCAM", "PDGFRL", "FN1", "ANPEP", "ITGA5", "NT5E", "THY1", "ENG", "PDGFRA", "PDGFRB", "SLC1A3", "S100A4", "MKI67", "RGS5"), ncol = 7, pt.size = 0)
+ggsave(p, path="F:/TIMElab/figures/FIG3", filename= "CAF_MSC_markers.pdf", width=7.5*1.5, height=3*1.5, dpi=700)
+```
+
+
+GO:0042641 seems to be upregulated in cluster 1 which also scores high for SMC cells. 
+
+Yang matrix pericytes
+```{r}
+DotPlot(seurat_obj_sub, features = c("COL4A1", "LAMA4", "SLC20A2", "SLC6A1", "SLC1A3"))
+```
+
+Yang zonation
+```{r}
+DotPlot(seurat_obj_sub, features = c("KCNMA1", "SLC4A4", "LAMA2", "FBLN1"))
+```
+
+Garcia
+```{r}
+DotPlot(seurat_obj_sub, features = c("ABCA10","FBLN1"))
+```
+
+
+
+
+### Scoring pericyte signatures
+
+
+#### Discovery cohort
+
+
+```{r}
+bulk_data = readRDS("F:/TIMElab/bulk_RNAseq/TCGA-CGGA-SummarizedExperiment.rds")
+```
+
+```{r}
+pericyte_markers = read_tsv("F:/TIMElab/GSE182109_processed/muralcell/markers_Mural_vs_ALL.tsv")
+
+pericyte_signature = pericyte_markers %>%
+  dplyr::filter(pct.1 > .5, avg_log2FC > 1) %>%
+  arrange(desc(avg_log2FC)) %>%
+  filter(gene %in% rownames(bulk_data)) %>%
+  head(50) %>%
+  pull(gene)
+```
+
+```{r}
+sig_scores = scrabble::score(
+  mat = assay(bulk_data),
+  groups = list("Mural" = pericyte_signature),
+  replace = T
+)
+bulk_data$pericyte_sigscore <- sig_scores[,"Mural"]
+```
+
+Violin plot
+```{r}
+d = colData(bulk_data) %>%
+  as.data.frame()
+
+stat.test <- d %>%
+  t_test(pericyte_sigscore ~ ECM.cluster) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(y.position = y.position+.2) %>%
+  arrange(p.adj)
+
+p = ggviolin(d,
+          x = "ECM.cluster",
+          y = "pericyte_sigscore",
+          add = c("boxplot", "jitter"),
+          color = "ECM.cluster",
+          palette = palette_ECM_subtype,
+          outlier.shape = NA,
+          width = 0.6) +
+  #geom_dotplot(aes(fill = Cluster, color = Cluster), binaxis='y', stackdir='center', dotsize=.4) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="Signature score") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(legend.position = "none") +
+  xlab(NULL)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.5
+p
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures/pericytes", filename= "pericyte_signature_score.pdf", width=3, height=3, dpi=700)
+```
+
+
+```{r}
+bulk_data$pericyte_sigscore_assignment <- NA
+bulk_data$pericyte_sigscore_assignment[sig_scores < quantile(sig_scores)[2]] <- "low"
+bulk_data$pericyte_sigscore_assignment[sig_scores > quantile(sig_scores)[4]] <- "high"
+```
+
+```{r}
+subtype_prop = colData(bulk_data) %>%
+  as.data.frame() %>%
+  filter(!is.na(pericyte_sigscore_assignment)) %>%
+  select(Subtype, pericyte_sigscore_assignment) %>%
+  group_by(Subtype, pericyte_sigscore_assignment) %>%
+  summarise(Count = n())
+
+# Basic piechart
+p1 = ggplot(subtype_prop %>% filter(pericyte_sigscore_assignment=="high"), aes(x="", y=Count, fill=Subtype)) +
+  geom_bar(stat="identity", width=1, color= "white") +
+  coord_polar("y", start=0) +
+  theme_void() +
+  scale_fill_manual(values  = palette_GBM_subtype) + ggtitle("Mural high")
+
+p2 = ggplot(subtype_prop %>% filter(pericyte_sigscore_assignment=="low"), aes(x="", y=Count, fill=Subtype)) +
+  geom_bar(stat="identity", width=1, color= "white") +
+  coord_polar("y", start=0) +
+  theme_void() +
+  scale_fill_manual(values  = palette_GBM_subtype) + ggtitle("Mural low")
+
+p1 + p2
+```
+
+```{r}
+ggsave(p1 + p2, path=paste0(fig_path, "/pericytes"), filename= "pericyte_signature_subtype_pie.pdf", width=4.5*1.2, height=1.5*1.2, dpi = 700)
+```
+
+
+
+
+```{r}
+library(survminer)
+library(survival)
+
+surv_data = colData(bulk_data) %>%
+  as.data.frame() %>%
+  drop_na(Deceased, pericyte_sigscore_assignment)
+
+surv_data = group_split(surv_data, Batch) %>% as.list()
+
+p1 = ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ pericyte_sigscore_assignment, data=surv_data[[1]]), pval=T, risk.table=F, risk.table.col="strata", pval.coord = c(2000, .9), palette = unname(palette_ECM_subtype), legend="none") + ggtitle("CGGA325")
+
+p2 = ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ pericyte_sigscore_assignment, data=surv_data[[2]]), pval=T, risk.table=F, risk.table.col="strata", pval.coord = c(2000, .9), palette = unname(palette_ECM_subtype), legend="none") + ggtitle("CGGA693")
+
+p3 = ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ pericyte_sigscore_assignment, data=surv_data[[3]]), pval=T, risk.table=F, risk.table.col="strata", pval.coord = c(900, .9), palette = unname(palette_ECM_subtype), legend="none") + ggtitle("TCGA")
+```
+
+```{r}
+pdf("F:/TIMElab/figures/pericytes/pericyte_signature_CGGA325_surv.pdf", width=3, height=2.5)
+print(p1, newpage = FALSE)
+dev.off()
+
+pdf("F:/TIMElab/figures/pericytes/pericyte_signature_CGGA693_surv.pdf", width=3, height=2.5)
+print(p2, newpage = FALSE)
+dev.off()
+
+pdf("F:/TIMElab/figures/pericytes/pericyte_signature_TCGA_surv.pdf", width=3, height=2.5)
+print(p3, newpage = FALSE)
+dev.off()
+```
+
+
+#### Cloughesy cohort
+
+Reading data
+```{r}
+cloughesy_bulk_data = readRDS("F:/TIMElab/Cloughesy/Cloughesy_DGEList.rds")
+```
+
+Scoring
+```{r}
+sig_scores = scrabble::score(
+  mat = cloughesy_bulk_data$log2cpm,
+  groups = list("Pericyte" = pericyte_signature),
+  replace = T
+)
+cloughesy_bulk_data$samples$pericyte_sigscore <- sig_scores[,"Pericyte"]
+```
+
+```{r}
+cloughesy_bulk_data$samples$pericyte_sigscore_assignment <- NA
+cloughesy_bulk_data$samples$pericyte_sigscore_assignment[sig_scores < quantile(sig_scores)[3]] <- "low"
+cloughesy_bulk_data$samples$pericyte_sigscore_assignment[sig_scores > quantile(sig_scores)[3]] <- "high"
+```
+
+Survival data
+```{r}
+library(survminer)
+library(survival)
+
+palette_ECM_subtype = c("ECMhi" = "#E64B35FF", "ECMlo" = "#4DBBD5FF")
+
+surv_data = cloughesy_bulk_data$samples %>%
+  filter(!is.na(pericyte_sigscore_assignment)) %>%
+  mutate(treatment = if_else(treatment.group=="A", "neo", "adj"),
+         group = paste(pericyte_sigscore_assignment, treatment))
+
+p1 = ggsurvplot(
+  survfit(Surv(OS, deceased) ~ group, data=surv_data), pval=T, risk.table=F, palette = c("#4DBBD5FF", "#8491B4B2", "#E64B35FF", "#F39B7fB2"), tables.height=.4, legend="right", ylab="OS (%)")
+
+p2 = ggsurvplot(
+  survfit(Surv(OS, deceased) ~ pericyte_sigscore_assignment, data=surv_data), pval=T, risk.table=F, palette = rev(unname(palette_ECM_subtype)), tables.height=.4, legend="right", ylab="OS (%)")
+```
+
+```{r}
+pdf("F:/TIMElab/figures/pericytes/Cloughesy_pericyte_therapy_surv.pdf", width=5.5, height=2.5)
+print(p1, newpage = FALSE)
+dev.off()
+
+pdf("F:/TIMElab/figures/pericytes/Cloughesy_pericyte_surv.pdf", width=6.5, height=2.5)
+print(p2, newpage = FALSE)
+dev.off()
+```
+
+```{r}
+p1 = ggsurvplot(
+  survfit(Surv(PFS, progression) ~ group, data=surv_data), pval=T, risk.table=F, palette = c("#4DBBD5FF", "#8491B4B2", "#E64B35FF", "#F39B7fB2"), tables.height=.4, legend="right", ylab="PFS (%)", pval.coord = c(300, .5))
+
+p2 = ggsurvplot(
+  survfit(Surv(PFS, progression) ~ pericyte_sigscore_assignment, data=surv_data), pval=T, risk.table=F, palette = rev(unname(palette_ECM_subtype)), tables.height=.4, legend="right", ylab="PFS (%)", pval.coord = c(300, .5))
+```
+
+```{r}
+pdf("F:/TIMElab/figures/pericytes/Cloughesy_pericyte_therapy_pfs.pdf", width=5.5, height=2.5)
+print(p1, newpage = FALSE)
+dev.off()
+
+pdf("F:/TIMElab/figures/pericytes/Cloughesy_pericyte_surv_pfs.pdf", width=6.5, height=2.5)
+print(p2, newpage = FALSE)
+dev.off()
+```
+
+
+
+### Scoring FB-like signatures
+
+
+#### Discovery cohort
+
+Using un-corrected logCPM values for scoring
+
+FB signature
+```{r}
+fb_markers = read_tsv("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/muralcell/markers_FB-like_vs_ALL.tsv")
+
+fb_signature = fb_markers %>%
+  dplyr::filter(pct.1 > .5, avg_log2FC > 1) %>%
+  arrange(desc(avg_log2FC)) %>%
+  head(50) %>%
+  pull(gene)
+
+writeLines(fb_signature, "/Volumes/TOSHIBA/TIMElab/GSE182109_processed/muralcell/FB-like_signature_genes.txt")
+```
+
+```{r}
+bulk_data = readRDS("F:/TIMElab/bulk_RNAseq/TCGA-CGGA-SummarizedExperiment.rds")
+```
+
+
+TCGA
+```{r}
+tcga  = readRDS("F:/TIMElab/bulk_RNAseq/TCGA_GBM_DGEList.rds")
+tcga$log2cpm = log2(tcga$cpm+0.0001)
+
+sig_scores_tcga = scrabble::score(
+  mat = tcga$log2cpm,
+  groups = list("FB like" = fb_signature[fb_signature%in%rownames(tcga)]),
+  replace = T
+)
+
+tcga$samples$FBlike.sigscore <- NULL
+tcga$samples$FBlike.sigscore <- sig_scores_tcga[,"FB like"]
+
+saveRDS(tcga, "F:/TIMElab/bulk_RNAseq/TCGA_GBM_DGEList.rds")
+```
+
+
+CGGA 693
+```{r}
+cgga693 = readRDS("F:/TIMElab/bulk_RNAseq/CGGA693_DGEList.rds")
+cgga693$log2cpm = log2(cgga693$cpm+0.0001)
+
+sig_scores_cgga693 = scrabble::score(
+  mat = cgga693$log2cpm,
+  groups = list("FB like" = fb_signature[fb_signature%in%rownames(cgga693)]),
+  replace = T
+)
+
+cgga693$samples$FBlike.sigscore <- NULL
+cgga693$samples$FBlike.sigscore <- sig_scores_cgga693[,"FB like"]
+
+saveRDS(cgga693, "F:/TIMElab/bulk_RNAseq/CGGA693_DGEList.rds")
+```
+
+
+CGGA 325
+```{r}
+cgga325 = readRDS("F:/TIMElab/bulk_RNAseq/CGGA325_DGEList.rds")
+cgga325$log2cpm = log2(cgga325$cpm+0.0001)
+
+sig_scores_cgga325 = scrabble::score(
+  mat = cgga325$log2cpm,
+  groups = list("FB like" = fb_signature[fb_signature%in%rownames(cgga325)]),
+  replace = T
+)
+
+cgga325$samples$FBlike.sigscore <- NULL
+cgga325$samples$FBlike.sigscore <- sig_scores_cgga325[,"FB like"]
+
+saveRDS(cgga325, "F:/TIMElab/bulk_RNAseq/CGGA325_DGEList.rds")
+```
+
+
+```{r}
+colData(bulk_data)$FBlike.sigscore = NULL
+colData(bulk_data)$FBlike.sigscore = colData(bulk_data) %>%
+  as.data.frame() %>%
+  rownames_to_column("sample") %>%
+  left_join(
+    as.data.frame(rbind(sig_scores_cgga325, sig_scores_cgga693, sig_scores_tcga)) %>%
+      rownames_to_column("sample"),
+    "sample"
+  ) %>%
+  pull("FB like")
+```
+
+
+Violin plot
+```{r}
+library(rstatix)
+library(cowplot)
+
+d = colData(bulk_data) %>% as.data.frame()
+
+stat.test <- d %>%
+  t_test(FBlike.sigscore ~ ECM.cluster) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(y.position = y.position+.2) %>%
+  arrange(p.adj)
+
+p = ggviolin(d,
+          x = "ECM.cluster",
+          y = "FBlike.sigscore",
+          add = c("boxplot", "jitter"),
+          color = "ECM.cluster",
+          palette = palette_ECM_subtype,
+          outlier.shape = NA,
+          width = 0.6) +
+  #geom_dotplot(aes(fill = Cluster, color = Cluster), binaxis='y', stackdir='center', dotsize=.4) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="Signature score") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(legend.position = "none") +
+  xlab(NULL)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.5
+p
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures/", filename= "FB-like_signature_score.pdf", width=2, height=3, dpi=700)
+```
+
+
+```{r}
+bulk_data$FBlike.enrich <- NA
+bulk_data$FBlike.enrich[bulk_data$FBlike.sigscore < quantile(bulk_data$FBlike.sigscore)[2]] <- "low"
+bulk_data$FBlike.enrich[bulk_data$FBlike.sigscore > quantile(bulk_data$FBlike.sigscore)[4]] <- "high"
+```
+
+```{r, eval=F}
+saveRDS(bulk_data, "F:/TIMElab/bulk_RNAseq/TCGA-CGGA-SummarizedExperiment.rds")
+```
+
+```{r}
+subtype_prop = colData(bulk_data) %>%
+  as.data.frame() %>%
+  filter(!is.na(FBlike.enrich)) %>%
+  select(Subtype, FBlike.enrich) %>%
+  group_by(Subtype, FBlike.enrich) %>%
+  summarise(Count = n())
+
+# Basic piechart
+p1 = ggplot(subtype_prop %>% filter(FBlike.enrich=="high"), aes(x="", y=Count, fill=Subtype)) +
+  geom_bar(stat="identity", width=1, color= "white") +
+  coord_polar("y", start=0) +
+  theme_void() +
+  scale_fill_manual(values  = palette_GBM_subtype) + ggtitle("FB-like high")
+
+p2 = ggplot(subtype_prop %>% filter(FBlike.enrich=="low"), aes(x="", y=Count, fill=Subtype)) +
+  geom_bar(stat="identity", width=1, color= "white") +
+  coord_polar("y", start=0) +
+  theme_void() +
+  scale_fill_manual(values  = palette_GBM_subtype) + ggtitle("FB-like low")
+
+p1 + p2
+```
+
+```{r}
+ggsave(p1 + p2, path="F:/TIMElab/figures", filename= "FB-like_signature_subtype_pie.pdf", width=4.5*1.2, height=1.5*1.2, dpi = 700)
+```
+
+
+
+
+```{r}
+library(survminer)
+library(survival)
+
+surv_data = colData(bulk_data) %>%
+  as.data.frame() %>%
+  drop_na(Deceased, FBlike.enrich)
+
+surv_data = group_split(surv_data, Batch) %>% as.list()
+
+p1 = ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ FBlike.enrich, data=surv_data[[1]]), pval=T, risk.table=F, risk.table.col="strata", pval.coord = c(2000, .9), palette = unname(palette_ECM_subtype), legend="none", ylab="OS (%)") + ggtitle("CGGA325")
+
+p2 = ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ FBlike.enrich, data=surv_data[[2]]), pval=T, risk.table=F, risk.table.col="strata", pval.coord = c(2000, .9), palette = unname(palette_ECM_subtype), legend="none", ylab="OS (%)") + ggtitle("CGGA693")
+
+p3 = ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ FBlike.enrich, data=surv_data[[3]]), pval=T, risk.table=F, risk.table.col="strata", pval.coord = c(900, .9), palette = unname(palette_ECM_subtype), legend="none", ylab="OS (%)") + ggtitle("TCGA")
+
+p1
+p2
+p3
+```
+
+```{r}
+pdf("F:/TIMElab/figures/FIG2/Supplement/FB-like_signature_CGGA325_surv.pdf", width=3, height=2.5)
+print(p1, newpage = FALSE)
+dev.off()
+
+pdf("F:/TIMElab/figures/FIG2/Supplement/FB-like_signature_CGGA693_surv.pdf", width=3, height=2.5)
+print(p2, newpage = FALSE)
+dev.off()
+
+pdf("F:/TIMElab/figures/FIG2/Supplement/FB-like_signature_TCGA_surv.pdf", width=3, height=2.5)
+print(p3, newpage = FALSE)
+dev.off()
+```
+
+
+#### Cloughesy cohort
+
+Reading data
+```{r}
+cloughesy_bulk_data = readRDS("F:/TIMElab/Cloughesy/Cloughesy_DGEList.rds")
+```
+
+```{r}
+pericyte_markers = read_tsv("F:/TIMElab/GSE182109_processed/muralcell/markers_FB-like_vs_ALL.tsv")
+
+pericyte_signature = pericyte_markers %>%
+  dplyr::filter(pct.1 > .5, avg_log2FC > 1) %>%
+  arrange(desc(avg_log2FC)) %>%
+  filter(gene %in% rownames(cloughesy_bulk_data)) %>%
+  head(50) %>%
+  pull(gene)
+```
+
+
+Scoring
+```{r}
+sig_scores = scrabble::score(
+  mat = cloughesy_bulk_data$log2cpm,
+  groups = list("Pericyte" = pericyte_signature),
+  replace = T
+)
+cloughesy_bulk_data$samples$pericyte_sigscore <- sig_scores[,"Pericyte"]
+```
+
+```{r}
+cloughesy_bulk_data$samples$pericyte_sigscore_assignment <- NA
+cloughesy_bulk_data$samples$pericyte_sigscore_assignment[sig_scores < log2(2)] <- "low"
+cloughesy_bulk_data$samples$pericyte_sigscore_assignment[sig_scores > log2(2)] <- "high"
+
+table(cloughesy_bulk_data$samples$pericyte_sigscore_assignment)
+```
+
+Survival data
+```{r}
+library(survminer)
+library(survival)
+
+palette_ECM_subtype = c("ECMhi" = "#E64B35FF", "ECMlo" = "#4DBBD5FF")
+
+surv_data = cloughesy_bulk_data$samples %>%
+  filter(!is.na(pericyte_sigscore_assignment)) %>%
+  mutate(treatment = if_else(treatment.group=="A", "neo", "adj"),
+         group = paste(pericyte_sigscore_assignment, treatment))
+
+p1 = ggsurvplot(
+  survfit(Surv(OS, deceased) ~ group, data=surv_data), pval=T, risk.table=F, palette = c("#E64B35FF", "#F39B7fB2", "#4DBBD5FF", "#8491B4B2"), tables.height=.4, legend="none", ylab="OS (%)", xlab = "Time (days)")
+
+p2 = ggsurvplot(
+  survfit(Surv(OS, deceased) ~ pericyte_sigscore_assignment, data=surv_data), pval=T, risk.table=F, palette = (unname(palette_ECM_subtype)), tables.height=.4, legend="none", ylab="OS (%)", xlab = "Time (days)")
+
+p1
+p2
+```
+
+```{r}
+pdf("F:/TIMElab/figures/FIG2/Cloughesy_FB-like_therapy_surv.pdf", width=3.5, height=2.5)
+print(p1, newpage = FALSE)
+dev.off()
+
+pdf("F:/TIMElab/figures/FIG2/Cloughesy_FB-like_surv.pdf", width=3.5, height=2.5)
+print(p2, newpage = FALSE)
+dev.off()
+```
+
+```{r}
+p1 = ggsurvplot(
+  survfit(Surv(PFS, progression) ~ group, data=surv_data), pval=T, risk.table=F, palette = c("#E64B35FF", "#F39B7fB2", "#4DBBD5FF", "#8491B4B2"), tables.height=.4, legend="none", ylab="PFS (%)", pval.coord = c(300, .5), xlab = "Time (days)")
+
+p2 = ggsurvplot(
+  survfit(Surv(PFS, progression) ~ pericyte_sigscore_assignment, data=surv_data), pval=T, risk.table=F, palette = (unname(palette_ECM_subtype)), tables.height=.4, legend="none", ylab="PFS (%)", pval.coord = c(300, .5), xlab = "Time (days)")
+
+p1
+p2
+```
+
+
+```{r}
+pdf("F:/TIMElab/figures/FIG2/Cloughesy_FB-like_therapy_pfs.pdf", width=3.5, height=2.5)
+print(p1, newpage = FALSE)
+dev.off()
+
+pdf("F:/TIMElab/figures/FIG2/Cloughesy_FB-like_surv_pfs.pdf", width=3.5, height=2.5)
+print(p2, newpage = FALSE)
+dev.off()
+```
+
+
+#### IVY GAP
+
+```{r}
+pericyte_markers = read_tsv("F:/TIMElab/GSE182109_processed/muralcell/markers_FB-like_vs_ALL.tsv")
+
+pericyte_signature = pericyte_markers %>%
+  dplyr::filter(pct.1 > .5, avg_log2FC > 1) %>%
+  arrange(desc(avg_log2FC)) %>%
+  filter(gene %in% rownames(bulk_data)) %>%
+  head(50) %>%
+  pull(gene)
+```
+
+Reading data
+```{r}
+fpkm_table = read_csv("F:/TIMElab/ivy_gap/gene_expression_matrix_2014-11-25/fpkm_table.csv")
+colnames(fpkm_table)[1] = "gene_id"
+rows_genes = read_csv("F:/TIMElab/ivy_gap/gene_expression_matrix_2014-11-25/rows-genes.csv")
+samples = read_tsv("F:/TIMElab/ivy_gap/processed/columns-samples.tsv")
+```
+
+```{r}
+fpkm_table$gene_symbol = rows_genes$gene_symbol
+fpkm_table$gene_id = NULL
+fpkm_table = fpkm_table %>% relocate(gene_symbol, 1) %>% column_to_rownames("gene_symbol")
+fpkm_table = log2(fpkm_table+0.001)
+```
+
+```{r}
+col_ivygap = c("#39829A", "#8E28C9", "#5EC7F6", "#EF6619", "#ED4119", "#46C509", "#49C69F")
+names(col_ivygap) = c("LE", "IT", "CTpnz", "CThbv", "CTmvp", "CT", "CTpan")
+```
+
+Heatmap of signature scores
+```{r}
+library(scrabble)
+
+sig_scores = scrabble::score(
+  mat = fpkm_table,
+  groups = list("FB score" = pericyte_signature)
+)
+
+ha = HeatmapAnnotation(
+  "Region" = factor(samples$structure, levels = c("LE", "IT", "CT", "CThbv", "CTmvp", "CTpan", "CTpnz")),
+  col = list(
+    "Region" = col_ivygap),
+  show_legend = T,
+  show_annotation_name = F,
+  simple_anno_size = unit(.3, "cm")
+)
+
+ht = Heatmap(t(sig_scores),
+        name = "Signature score",
+        top_annotation = ha,
+        column_split = factor(samples$structure, levels = c("LE", "IT", "CT", "CThbv", "CTmvp", "CTpan", "CTpnz")),
+        show_column_dend = F,
+        show_row_dend = F,
+        column_title_rot = 90,
+        show_column_names = F,
+        col = colorRamp2(seq(-4, 4, length.out=11), rev(brewer.pal(n=11, name="RdBu"))),
+        width = unit(8, "cm"), 
+        height = unit(2, "cm"))
+
+ht
+```
+
+
+```{r}
+samples$FB_score = sig_scores[,"FB score"]
+
+
+p = ggviolin(samples,
+          x = "structure",
+          y = "FB_score",
+          add = c("boxplot", "jitter"),
+          color = "structure",
+          palette = col_ivygap,
+          outlier.shape = NA,
+          width = 0.6) +
+  #geom_dotplot(aes(fill = Cluster, color = Cluster), binaxis='y', stackdir='center', dotsize=.4) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="Signature score") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(legend.position = "none") +
+  xlab(NULL)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.5
+p
+```
+
+```{r}
+ggsave(p, path="F:/TIMElab/figures", filename= "IVY_GAP_FB_like_score.pdf", width=4, height=2.5, dpi=700)
+```
+
+
+
+### CAF Jain
+
+Psseudobulk samples
+
+```{r, eval=F}
+library(scuttle)
+library(edgeR)
+
+DefaultAssay(seurat_obj) <- "RNA"
+merged_sce <- as.SingleCellExperiment(DietSeurat(seurat_obj))
+merged_sce@assays@data$logcounts <- NULL
+summed <- aggregateAcrossCells(merged_sce, 
+                               id=colData(merged_sce)[,c("cell.type", "seq_folder")],
+                               use.assay.type = 1)
+summed.filt <- summed[,summed$ncells >= 10]
+y <- DGEList(counts(summed.filt), samples=colData(summed.filt))
+
+keep <- filterByExpr(y)
+y <- y[keep,]
+y <- calcNormFactors(y)
+y$log2cpm = cpm(y, log=TRUE)
+
+saveRDS(y, "F:/TIMElab/GSE182109_processed/cell.type_pseudobulk.rds")
+```
+
+```{r}
+caf_jain = readRDS("F:/TIMElab/GSE132825/TMM_norm_DGEList.rds")
+y = readRDS("F:/TIMElab/GSE182109_processed/celltypefine_pseudobulk.rds")
+```
+
+Joining matrices
+```{r}
+overlapping_genes = intersect(rownames(y), rownames(caf_jain))
+merged_mat = cbind(y$log2cpm[overlapping_genes,], caf_jain$cpm[overlapping_genes,])
+
+coldata1 = y$samples %>%
+  unite("sample_name", c(seq_folder, cell.type.fine), remove=F) %>%
+  select(sample_name, ident = cell.type.fine) %>%
+  mutate(batch = "GSE182109")
+
+coldata2 = caf_jain$samples
+coldata2$sample_name = rownames(coldata2)
+coldata2$batch = "GSE132825"
+coldata2 = coldata2 %>% select(sample_name, batch)
+coldata2$ident = c("Jain CAF")
+
+merged_coldata = rbind(coldata1, coldata2)
+```
+
+```{r}
+source("util.R")
+p = plot_PCA(merged_mat,
+         merged_coldata,
+         "batch")
+p
+```
+
+Batch correction
+```{r}
+library(limma)
+merged_mat_corrected = limma::removeBatchEffect(merged_mat,
+                                         batch = merged_coldata$batch)
+```
+
+```{r}
+p = plot_PCA(merged_mat_corrected,
+         merged_coldata,
+         "batch")
+p
+```
+
+
+```{r}
+colnames(merged_mat) <- merged_coldata$sample_name
+
+merged_mat_summarized = merged_mat %>%
+  as.data.frame() %>%
+  rownames_to_column("Gene") %>%
+  pivot_longer(!Gene, names_to = "sample_name", values_to = "expression") %>%
+  left_join(merged_coldata, "sample_name") %>%
+  group_by(Gene, ident) %>%
+  summarise(mean_expression = mean(expression)) %>%
+  pivot_wider(names_from = "ident", values_from = "mean_expression") %>%
+  column_to_rownames("Gene")
+  
+```
+
+
+```{r}
+library(corrplot)
+
+merged_mat_summarized_filtered = merged_mat_summarized[apply(merged_mat_summarized, 1, mad) > .1,]
+
+cor_mat = cor(merged_mat_summarized_filtered, method = "spearman")
+corrplot(cor_mat, type="lower", col.lim = c(0,1))
+```
+
+```{r}
+d = data.frame(cor = cor_mat["Jain CAF",]) %>%
+  rownames_to_column("cell.type") %>%
+  filter(cell.type!="Jain CAF") %>%
+  arrange(desc(cor))
+
+ggbarplot(d, "cell.type", "cor",
+ fill = "steelblue", color = "steelblue",
+ label = F, lab.pos = "in", lab.col = "white") +
+   theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+
+
+
+```{r}
+pdf(paste0(fig_path, "CAF_Jain_correlation.pdf"), width = 4, height = 4)
+corrplot(cor_mat, type="lower",addCoef.col = "white")
+dev.off()
+```
+
+
+
+
+
+
+## Merging cell type annotations
+
+
+
+```{r}
+cell_anno_fine = rbind(
+  read_tsv("F:/TIMElab/GSE182109_processed/cell_anno/glioma.tsv"),
+  read_tsv("F:/TIMElab/GSE182109_processed/cell_anno/myeloid.tsv"),
+  read_tsv("F:/TIMElab/GSE182109_processed/cell_anno/tcells.tsv"),
+  read_tsv("F:/TIMElab/GSE182109_processed/cell_anno/muralcell.tsv")
+)
+```
+
+```{r}
+to_keep = c("Oligo", "B cell", "Endothelial")
+to_keep_d = seurat_obj@meta.data %>%
+  rownames_to_column("Cell") %>%
+  select(Cell, cell.type.fine = cell.type) %>%
+  filter(cell.type.fine %in% to_keep)
+```
+
+```{r}
+cell_anno_fine = rbind(cell_anno_fine, to_keep_d)
+
+dim(seurat_obj)
+
+seurat_obj$cell.type.fine = NULL
+seurat_obj@meta.data = seurat_obj@meta.data %>%
+  rownames_to_column("Cell") %>%
+  left_join(cell_anno_fine, by = "Cell") %>%
+  column_to_rownames("Cell")
+
+p = DimPlot(seurat_obj, group.by = "cell.type.fine")
+p
+```
+```{r}
+ggsave(p, path="F:/TIMElab/figures", filename= "umap_glioma_cell.type.fine.pdf", width=7.2, height=5, dpi=700)
+```
+
+```{r}
+write_tsv(seurat_obj@meta.data %>%
+  rownames_to_column("Cell") %>%
+  dplyr::select(Cell, cell.type, cell.type.fine),
+  "F:/TIMElab/GSE182109_processed/cell_anno/new_cell_anno.tsv")
+```
+
+
+```{r}
+saveRDS(seurat_obj, "F:/TIMElab/GSE182109_processed/integrated_filtered_seurat_object.rds")
+```
+
+
+## CopyKat predictions
+
+Writing the data
+```{r}
+library(data.table)
+
+for (x in unique(seurat_obj$seq_folder)) {
+  exp.rawdata <- seurat_obj[,seurat_obj$seq_folder==x]@assays$RNA@counts
+  exp.rawdata <- as.data.table(exp.rawdata, keep.rownames=T)
+  fwrite(exp.rawdata, file = paste0("F:/TIMElab/GSE182109_processed/copykat/input/", x, ".txt"), sep = "\t", row.names = F, col.names = T)
+}
+
+## NB! remove rn column
+```
+
+
+```{r}
+library(copykat)
+
+file_names = list.files("F:/TIMElab/GSE182109_processed/copykat/output/")
+
+copykat_pred = data.frame()
+for (i in file_names) {
+  copykat.test <- readRDS(paste0("F:/TIMElab/GSE182109_processed/copykat/output/", i))
+  pred.test <- data.frame(copykat.test$prediction)
+  copykat_pred <- rbind(copykat_pred, pred.test)
+}
+copykat_pred$cell.names = gsub("\\.", "-", copykat_pred$cell.names)
+copykat_pred
+```
+
+Adding to the Seurat object
+```{r}
+seurat_obj = readRDS("F:/TIMElabGSE182109_processed/integrated_filtered_seurat_object.rds")
+ncol(seurat_obj) == nrow(copykat_pred)
+```
+
+
+```{r}
+seurat_obj$copykat.pred = NULL
+seurat_obj$copykat.pred = seurat_obj@meta.data %>%
+  rownames_to_column("cell.names") %>%
+  left_join(copykat_pred, "cell.names") %>%
+  pull(copykat.pred)
+```
+
+
+```{r}
+failed_samples = c(3, 5, 6, 7, 10, 13, 16, 17, 21, 32)
+failed_samples = unique(seurat_obj$seq_folder)[failed_samples]
+
+myeloid_aneu = seurat_obj@meta.data %>% group_by(seq_folder, cell.type, copykat.pred) %>% summarise(Count = n()) %>% mutate(Prop = Count/sum(Count)) %>% filter(cell.type == "Myeloid") %>% filter(copykat.pred == "aneuploid") %>% arrange(desc(Prop))
+
+tcell_aneu = seurat_obj@meta.data %>% group_by(seq_folder, cell.type, copykat.pred) %>% summarise(Count = n()) %>% mutate(Prop = Count/sum(Count)) %>% filter(cell.type == "T cell") %>% filter(copykat.pred == "aneuploid") %>% arrange(desc(Prop))
+```
+
+```{r}
+abnormal_samples = myeloid_aneu %>% filter(Prop > .5) %>% pull(seq_folder)
+```
+
+```{r}
+fail_qc = unique(c(abnormal_samples, failed_samples))
+pass_qc = setdiff(unique(seurat_obj$seq_folder), fail_qc)
+```
+
+```{r}
+seurat_obj@meta.data$copykat.pred.filt <- NULL
+seurat_obj@meta.data$copykat.pred.filt <- seurat_obj@meta.data  %>%
+  mutate(copykat.pred.filt = if_else(seq_folder %in% fail_qc, "not.defined", copykat.pred)) %>%
+  pull(copykat.pred.filt)
+```
+
+
+```{r}
+DimPlot(seurat_obj, split.by  = "copykat.pred.filt")
+DimPlot(seurat_obj, group.by = "cell.type")
+```
+
+
+```{r}
+library(cowplot)
+
+ p = ggplot(data = seurat_obj@meta.data %>% filter(copykat.pred.filt != "not.defined"), aes(x = cell.type, fill = copykat.pred.filt)) + 
+  geom_histogram(colour = 'white', position = 'fill', stat = "count") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  theme_cowplot() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(x = NULL, y = "Frequency") +
+  scale_fill_manual(values = c("aneuploid" = "#DC0000FF", "diploid" = "#91D1C2FF"))
+ 
+ ggsave(p, path="F:/TIMElabfigures/FIG2/Supplement", filename= "copykat_pred.pdf", width=5, height=3, dpi=700)
+```
+
+
+```{r}
+p1 = ggplot(data = filter(seurat_obj@meta.data, cell.type=="Mural cell", copykat.pred.filt != "not.defined", ECM.cluster != "undefined"), aes(x = ECM.cluster, fill = copykat.pred.filt)) + 
+  geom_histogram(colour = 'white', position = 'stack', stat = "count") +
+  theme_cowplot() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(x = NULL, y = "Number of cells") +
+  scale_fill_manual(values = c("aneuploid" = "#DC0000FF", "diploid" = "#91D1C2FF"))
+
+p2 = ggplot(data = filter(seurat_obj@meta.data, cell.type=="Mural cell", copykat.pred.filt != "not.defined", ECM.cluster != "undefined"), aes(x = ECM.cluster, fill = copykat.pred.filt)) + 
+  geom_histogram(colour = 'white', position = 'fill', stat = "count") +
+  theme_cowplot() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(x = NULL, y = "Frequency") +
+  scale_fill_manual(values = c("aneuploid" = "#DC0000FF", "diploid" = "#91D1C2FF"))
+
+ggsave(p1, path="F:/TIMElabfigures/FIG2/Supplement", filename= "copykat_pred_mural_cell_number.pdf", width=3.5, height=3, dpi=700)
+ggsave(p2, path="F:/TIMElabfigures/FIG2/Supplement", filename= "copykat_pred_mural_cell_prop.pdf", width=3.5, height=3, dpi=700)
+``` 
+
+```{r}
+p1 = ggplot(data = filter(seurat_obj@meta.data, cell.type.fine=="FB-like", copykat.pred.filt != "not.defined", ECM.cluster != "undefined"), aes(x = ECM.cluster, fill = copykat.pred.filt)) + 
+  geom_histogram(colour = 'white', position = 'stack', stat = "count") +
+  theme_cowplot() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(x = NULL, y = "Number of cells") +
+  scale_fill_manual(values = c("aneuploid" = "#DC0000FF", "diploid" = "#91D1C2FF"))
+
+p2 = ggplot(data = filter(seurat_obj@meta.data, cell.type.fine=="FB-like", copykat.pred.filt != "not.defined", ECM.cluster != "undefined"), aes(x = ECM.cluster, fill = copykat.pred.filt)) + 
+  geom_histogram(colour = 'white', position = 'fill', stat = "count") +
+  theme_cowplot() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(x = NULL, y = "Frequency") +
+  scale_fill_manual(values = c("aneuploid" = "#DC0000FF", "diploid" = "#91D1C2FF"))
+
+ggsave(p1, path="H:/TIMElab/figures/FIG2/Supplement", filename= "copykat_pred_fblike_cell_number.pdf", width=3.5, height=3, dpi=700)
+ggsave(p2, path="H:/TIMElab/figures/FIG2/Supplement", filename= "copykat_pred_fblike_cell_prop.pdf", width=3.5, height=3, dpi=700)
+``` 
+
+```{r}
+filter(seurat_obj@meta.data, cell.type.fine=="FB-like", copykat.pred.filt != "not.defined", ECM.cluster != "undefined") %>% group_by(ECM.cluster, copykat.pred.filt) %>% summarise(Count = n()) %>% mutate(prop = Count/sum(Count))
+```
+
+
+
+
+
+```{r}
+saveRDS(seurat_obj, "H:/TIMElab/GSE182109_processed/integrated_filtered_seurat_object.rds")
+```
+
+
+
+
+#### Exploring subclones
+
+```{r}
+library(copykat)
+
+file_names = list.files("F:/TIMElab/GSE182109_processed/copykat/output/")
+
+copykat.test <- readRDS(paste0("F:/TIMElabGSE182109_processed/copykat/output/", file_names[1]))
+copykat_pred <- data.frame(copykat.test$CNAmat)
+
+for (i in file_names[2:length(file_names)]) {
+  copykat.test <- readRDS(paste0("F:/TIMElabGSE182109_processed/copykat/output/", i))
+  pred.test <- data.frame(copykat.test$CNAmat)
+  copykat_pred <- cbind(copykat_pred, pred.test[,4:ncol(pred.test)])
+}
+copykat_pred$cell.names = gsub("\\.", "-", copykat_pred$cell.names)
+copykat_pred
+
+copykat.test
+bind_cols(copykat_pred, pred.test[,4:ncol(pred.test)])
+```
+
+
+
+
+
+
+```{r}
+copykat.test <- readRDS(paste0("F:/TIMElab/GSE182109_processed/copykat/output/", "GSM5518627.rds"))
+CNA.test <- data.frame(copykat.test$CNAmat)
+cell_anno <- read_tsv("F:/TIMElab/GSE182109_processed/cell_anno/cell_anno.tsv")
+```
+
+```{r}
+copykat.test_sub <- copykat.test
+copykat.test_sub$prediction <- copykat.test_sub$prediction[1:500,]
+copykat.test_sub$prediction$cell.names <- gsub("\\.", "-", copykat.test_sub$prediction$cell.names)
+
+copykat.test_sub$prediction %>%
+  left_join(cell_anno, "cell.names") -> copykat.test_sub$prediction
+
+copykat.test_sub$CNAmat <- copykat.test_sub$CNAmat[1:500,1:(500+3)]
+CNA.test <- data.frame(copykat.test_sub$CNAmat)
+```
+
+
+
+```{r}
+row_ha = rowAnnotation(
+  "Cell type" = copykat.test_sub$prediction$cell.type,
+  #col = list("Malignancy" = c("aneuploid" = "#DC0000FF", "diploid" = "#91D1C2FF")),
+  show_legend = T,
+  simple_anno_size = unit(.3, "cm"))
+
+Heatmap(
+  t(CNA.test[,4:ncol(CNA.test)]),
+  #col = colorRamp2(seq(-.1, .1, length.out=11), rev(brewer.pal(n=11, name="RdBu"))),
+  name = "CN (log ratio)",
+  row_split = factor(copykat.test_sub$prediction$copykat.pred),
+  show_row_names = F,
+  show_column_names = F,
+  cluster_columns = F,
+  right_annotation = row_ha
+)
+```
+
+
+
+
+
+```{r}
+ my_palette <- colorRampPalette(rev(RColorBrewer::brewer.pal(n = 3, name = "RdBu")))(n = 999)
+
+  chr <- as.numeric(CNA.test$chrom) %% 2+1
+  rbPal1 <- colorRampPalette(c('black','grey'))
+  CHR <- rbPal1(2)[as.numeric(chr)]
+  chr1 <- cbind(CHR,CHR)
+
+  rbPal5 <- colorRampPalette(RColorBrewer::brewer.pal(n = 8, name = "Dark2")[2:1])
+  com.preN <- pred.test$copykat.pred
+  pred <- rbPal5(2)[as.numeric(factor(com.preN))]
+
+  cells <- rbind(pred,pred)
+  col_breaks = c(seq(-1,-0.4,length=50),seq(-0.4,-0.2,length=150),seq(-0.2,0.2,length=600),seq(0.2,0.4,length=150),seq(0.4, 1,length=50))
+
+heatmap.3(t(CNA.test[,4:ncol(CNA.test)]),dendrogram="r", distfun = function(x) parallelDist::parDist(x,threads =10, method = "euclidean"), hclustfun = function(x) hclust(x, method="ward.D2"),
+            ColSideColors=chr1,RowSideColors=cells,Colv=NA, Rowv=TRUE,
+            notecol="black",col=my_palette,breaks=col_breaks, key=TRUE,
+            keysize=1, density.info="none", trace="none",
+            cexRow=0.1,cexCol=0.1,cex.main=1,cex.lab=0.1,
+            symm=F,symkey=F,symbreaks=T,cex=1, cex.main=4, margins=c(10,10))
+
+  legend("topright", paste("pred.",names(table(com.preN)),sep=""), pch=15,col=RColorBrewer::brewer.pal(n = 8, name = "Dark2")[2:1], cex=0.6, bty="n")
+
+```
+
+
+
+### Converting to h5ad for SCENIC
+
+```{r}
+library(Seurat)
+library(SeuratData)
+library(SeuratDisk)
+```
+
+```{r}
+
+SaveH5Seurat(seurat_obj_sub, filename = "F:/TIMElab/GSE182109_processed/muralcells.h5Seurat")
+Convert("F:/TIMElab/GSE182109_processed/muralcells.h5Seurat", dest = "h5ad")
+
+seurat_obj <- DietSeurat(seurat_obj)
+seurat_obj@assays$integrated <- NULL
+seurat_obj
+```
+
+
+
+```{r}
+SaveH5Seurat(seurat_obj, filename = "F:/TIMElab/GSE182109_processed/SCENIC/integrated_filtered_seurat_object.h5Seurat")
+Convert("F:/TIMElab/GSE182109_processed/SCENIC/integrated_filtered_seurat_object.h5Seurat", dest = "h5ad")
+
+```
+
+
+#### Subsampling
+
+```{r}
+library(Seurat)
+library(SeuratData)
+library(SeuratDisk)
+```
+
+
+```{r}
+idx = seurat_obj@meta.data %>% filter(cell.type.fine == "FB-like") %>% group_by(patient) %>% summarise(Count = n()) %>% arrange(desc(Count)) %>% head(4) %>% pull(patient)
+Idents(seurat_obj) = "patient"
+seurat_obj_sub = subset(seurat_obj, idents = idx)
+```
+
+```{r}
+rm(seurat_obj)
+```
+
+```{r}
+seurat_obj_sub <- DietSeurat(seurat_obj_sub)
+seurat_obj_sub@assays$integrated <- NULL
+
+SaveH5Seurat(seurat_obj_sub, filename = "F:/TIMElab/GSE182109_processed/seurat_obj_sub.h5Seurat")
+Convert("F:/TIMElab/GSE182109_processed/seurat_obj_sub.h5Seurat", dest = "h5ad")
+```
+
+
+
+Filtering gene matrix
+```{r}
+seurat_obj_sub <- DietSeurat(seurat_obj_sub)
+seurat_obj_sub@assays$integrated <- NULL
+
+# filtering by gene expression
+seurat_obj_sub_filt = seurat_obj_sub[rowSums(seurat_obj_sub@assays$RNA@counts) > 1*.01*ncol(seurat_obj_sub),]
+
+# filterging by expression per cell
+seurat_obj_sub_filt = seurat_obj_sub_filt[rowSums(seurat_obj_sub_filt@assays$RNA@counts > 1) > .01*ncol(seurat_obj_sub_filt),]
+```
+
+Saving sa loom file
+```{r}
+SaveLoom(seurat_obj_sub_filt, "F:/TIMElab/GSE182109_processed/seurat_obj_sub.loom", overwrite = T, verbose = TRUE)
+```
+
+
+
+Saving a small object for testing
+```{r}
+seurat_obj_sub = subset(seurat_obj_sub, idents = idx[1])
+```
+
+Filtering gene matrix
+```{r}
+seurat_obj_sub <- DietSeurat(seurat_obj_sub)
+seurat_obj_sub@assays$integrated <- NULL
+
+# filtering by gene expression
+seurat_obj_sub_filt = seurat_obj_sub[rowSums(seurat_obj_sub@assays$RNA@counts) > 1*.01*ncol(seurat_obj_sub),]
+
+# filterging by expression per cell
+seurat_obj_sub_filt = seurat_obj_sub_filt[rowSums(seurat_obj_sub_filt@assays$RNA@counts > 1) > .01*ncol(seurat_obj_sub_filt),]
+```
+
+Saving sa loom file
+```{r}
+SaveLoom(seurat_obj_sub_filt, "F:/TIMElab/GSE182109_processed/seurat_obj_sub_small.loom", overwrite = T, verbose = TRUE)
+```
+

@@ -1,0 +1,367 @@
+---
+title: "Ganglioglioma"
+author: "Maksym"
+date: "3/8/2023"
+output: html_document
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(SCIPAC)
+library(SingleCellExperiment)
+```
+
+
+```{r}
+root_dir = "/Volumes/TOSHIBA/TIMElab/SCPCP000002"
+folders = list.files(root_dir)
+folders = folders[grepl("^SC", folders)]
+```
+
+```{r}
+count_data = matrix(nrow = 40316, ncol = 0)
+metadata = data.frame()
+
+for (i in folders) {
+  
+  files = list.files(paste(root_dir, i, sep = "/"), full.names = "T")
+  files = files[grepl("_processed", files)]
+  
+  sce_obj = readRDS(files)
+  sce_obj = sce_obj[!is.na(rowData(sce_obj)$gene_symbol),]
+  
+  count_mtx = assay(sce_obj, "counts")
+  rownames(count_mtx) = rowData(sce_obj)$gene_symbol
+  sce_obj_meta = colData(sce_obj) %>% as.data.frame() %>% mutate(Sample = i)
+  sce_obj_meta$barcodes = paste(i, sce_obj_meta$barcodes, sep = "-")
+  rownames(sce_obj_meta) = sce_obj_meta$barcodes
+  colnames(count_mtx) = rownames(sce_obj_meta)
+  
+  count_data = cbind(count_data, count_mtx)
+  metadata = bind_rows(metadata, sce_obj_meta)
+}
+
+```
+
+```{r}
+seurat_obj = CreateSeuratObject(
+  counts = count_data,
+  meta.data = metadata
+)
+```
+
+
+## Clustering
+
+```{r}
+seurat_obj <- NormalizeData(seurat_obj)
+seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+seurat_obj <- ScaleData(seurat_obj)
+seurat_obj <- RunPCA(seurat_obj, features = VariableFeatures(object = seurat_obj))
+ElbowPlot(seurat_obj)
+```
+
+
+```{r}
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:13)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.2)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:13)
+DimPlot(seurat_obj, label=T)
+```
+
+```{r}
+markers = FindMarkers(seurat_obj,
+                      ident.1 = 9,
+                      only.pos = TRUE,
+                      logfc.threshold = 1,
+                      min.pct = 0.2)
+```
+
+
+
+```{r}
+p = DotPlot(seurat_obj,
+        features = c("PDGFRA", "SOX2", "OLIG1", "NES", "GFAP", "S100B", "EGFR", "MBP", "PDGFRB", "ACTA2", "COL1A1", "PROM1", "PECAM1", "TEK", "P2RY12", "PTPRC", "ITGAM", "ITGAX", "S100A8", "CD68", "CD163", "HLA-DQA1", "MRC1", "NKG7", "CD3E", "CD8A", "CD4", "CD79A", "MKI67", "IFNG", "GZMB", "IL2", "SLAMF6", "CD19"),
+        cluster.idents = T) +
+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+p
+```
+
+```{r}
+Idents(seurat_obj) <- "RNA_snn_res.0.2"
+seurat_obj <- RenameIdents(object = seurat_obj, 
+                              "0" = "APC",
+                              "1" = "Inflam.",
+                              "2" = "NK",
+                              "3" = "Tumor",
+                              "4" = "APC",
+                              "5" = "Tumor",
+                              "6" = "Tumor",
+                              "7" = "n.d.",
+                              "8" = "n.d.",
+                           "9" = "NK",
+                           "10" = "T",
+                           "11" = "APC",
+                           "12" = "Fibroblast",
+                           "13" = "Tumor")
+seurat_obj$cell.type = Idents(seurat_obj)
+Idents(seurat_obj) = "cell.type"
+DimPlot(seurat_obj)
+```
+
+```{r}
+saveRDS(seurat_obj, "/Volumes/TOSHIBA/TIMElab/SCPCP000002/seurat_obj.rds")
+```
+
+## Matrisome expression
+
+```{r}
+matrisome_d = readxl::read_xlsx("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/matrisome_hs_masterlist.xlsx")
+core_matrisome_d = matrisome_d %>% filter(Division=="Core matrisome")
+core_matrisome_d = core_matrisome_d[core_matrisome_d$`Gene Symbol`%in%rownames(seurat_obj),]
+```
+
+Courtesy of raveancic
+```{r}
+PrctCellExpringGene <- function(object, genes, group.by = "all"){
+    if(group.by == "all"){
+        prct = unlist(lapply(genes,calc_helper, object=object))
+        result = data.frame(Markers = genes, Cell_proportion = prct)
+        return(result)
+    }
+
+    else{        
+        list = SplitObject(object, group.by)
+        factors = names(list)
+
+        results = lapply(list, PrctCellExpringGene, genes=genes)
+        for(i in 1:length(factors)){
+        results[[i]]$Feature = factors[i]
+        }
+        combined = do.call("rbind", results)
+        return(combined)
+    }
+}
+
+calc_helper <- function(object,genes){
+    counts = object[['RNA']]@counts
+    ncells = ncol(counts)
+    if(genes %in% row.names(counts)){
+    sum(counts[genes,]>0)/ncells
+    }else{return(NA)}
+}
+```
+
+```{r}
+prct_expressed = PrctCellExpringGene(seurat_obj, core_matrisome_d$`Gene Symbol`, group.by = "cell.type")
+rownames(prct_expressed) = 1:nrow(prct_expressed)
+```
+
+
+```{r}
+highly_expressed = unique(prct_expressed$Markers[prct_expressed$Cell_proportion>.1])
+```
+
+
+```{r}
+p = DotPlot(
+  seurat_obj, cluster.idents = T,
+  scale = F,
+  features = core_matrisome_d[core_matrisome_d$`Gene Symbol`%in%highly_expressed,]$`Gene Symbol`
+) + coord_flip() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + scale_colour_gradient2(low = "#3C5488FF", mid = "grey", high = "#DC0000FF")
+
+p
+```
+
+```{r}
+fig_path = "/Volumes/TOSHIBA/TIMElab/SCPCP000002"
+ggsave(p, path=fig_path, filename= "matrisome_expression.pdf", width=8, height=20, dpi = 700)
+```
+
+
+
+## Subclustering stromal cells
+
+```{r}
+seurat_obj_sub = subset(seurat_obj, idents = c("Fibroblast"))
+```
+
+```{r}
+seurat_obj_sub = DietSeurat(seurat_obj_sub)
+```
+
+```{r}
+seurat_obj_sub <- NormalizeData(seurat_obj_sub)
+seurat_obj_sub <- FindVariableFeatures(seurat_obj_sub, selection.method = "vst", nfeatures = 2000)
+seurat_obj_sub <- ScaleData(seurat_obj_sub)
+seurat_obj_sub <- RunPCA(seurat_obj_sub, features = VariableFeatures(object = seurat_obj_sub))
+ElbowPlot(seurat_obj_sub)
+```
+
+
+```{r}
+seurat_obj_sub <- FindNeighbors(seurat_obj_sub, dims = 1:7)
+seurat_obj_sub <- FindClusters(seurat_obj_sub, resolution = 0.5)
+seurat_obj_sub <- RunUMAP(seurat_obj_sub, dims = 1:7)
+Idents(seurat_obj_sub) <- "cell.type"
+DimPlot(seurat_obj_sub)
+```
+
+```{r}
+saveRDS(seurat_obj_sub, "/Volumes/TOSHIBA/TIMElab/SCPCP000002/stromal_cells.rds")
+```
+
+
+
+
+
+## Bulk Data
+
+```{r}
+mtx = read_tsv("/Volumes/TOSHIBA/TIMElab/SCPCP000002/bulk_quant.tsv") %>% column_to_rownames("gene_id")
+```
+
+```{r}
+library('biomaRt')
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+
+genes <- rownames(mtx)
+G_list <- getBM(filters= "ensembl_gene_id", attributes= c("ensembl_gene_id", "hgnc_symbol"),values=genes,mart= mart)
+G_list
+```
+
+```{r}
+dups = unique(G_list$hgnc_symbol[duplicated(G_list$hgnc_symbol)])
+G_list = G_list[!G_list$hgnc_symbol%in%dups,]
+```
+
+```{r}
+mtx = mtx[G_list$ensembl_gene_id,]
+rownames(mtx) = G_list$hgnc_symbol
+```
+
+```{r}
+mtx
+```
+
+```{r}
+bulk_metadata = read_tsv("/Volumes/TOSHIBA/TIMElab/SCPCP000002/bulk_metadata.tsv") %>% column_to_rownames("sample_id")
+colnames(mtx) = rownames(bulk_metadata)
+```
+
+
+### Normalization
+
+
+```{r}
+library(edgeR)
+
+dge = DGEList(counts=mtx,
+             samples=bulk_metadata)
+
+keep = filterByExpr(dge)
+dge = dge[keep,,keep.lib.sizes=FALSE]
+dge = calcNormFactors(dge, method = "TMM")
+dge$logcpm = cpm(dge, log=T)
+```
+
+
+```{r}
+plotMDS.DGEList(dge)
+```
+
+
+### Subtype calling
+
+```{r}
+sigs = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+ECMhi_sig = sigs$ECMhi
+ECMlo_sig = sigs$ECMlo
+#sig_genes_d = rbind(data.frame(Gene = ECMhi_sig, Sig = "ECMhi"), data.frame(Gene = ECMlo_sig, Sig = "ECMlo"))
+```
+
+```{r}
+library(scrabble)
+library(ComplexHeatmap)
+
+sigs$ECMhi = sigs$ECMhi[sigs$ECMhi%in%rownames(dge)]
+sigs$ECMlo = sigs$ECMlo[sigs$ECMlo%in%rownames(dge)]
+
+sig_scores = scrabble::score(
+  mat = dge$logcpm,
+  groups = sigs
+)
+
+dge$samples$ECMhi.score = sig_scores[,"ECMhi"]
+dge$samples$ECMlo.score = sig_scores[,"ECMlo"]
+
+dge$samples$ECM.cluster = sig_scores %>%
+  as.data.frame() %>%
+  mutate(ECM.cluster = if_else(ECMhi > 0 & ECMlo < -(0), "ECMhi",
+                               if_else(ECMhi < (-0) & ECMlo > 0, "ECMlo", "mixed"))) %>%
+  pull(ECM.cluster)
+
+hcl_obj = hclust(dist(sig_scores))
+cluster_calls = cutree(hcl_obj, k=2)
+
+Heatmap(t(sig_scores),
+        cluster_columns = hcl_obj, show_column_names = F)
+```
+
+```{r}
+table(dge$samples$ECM.cluster)
+```
+
+```{r}
+saveRDS(dge, "/Volumes/TOSHIBA/TIMElab/SCPCP000002/bulk_DGEList.rds")
+```
+
+
+## SCIPAC
+
+```{r}
+load("/Volumes/TOSHIBA/TIMElab/SCPCP000002/SCIPAC_data.RData")
+seurat_obj = readRDS("/Volumes/TOSHIBA/TIMElab/SCPCP000002/seurat_obj.rds")
+```
+
+```{r}
+SCIPAC.res <- SCIPAC(bulk.dat = bulk.dat.dim.redu, y = y, 
+                     family = "binomial", ct.res = ct.res, 
+                     ela.net.alpha = 0.4, bt.size = 50, 
+                     numCores = 7, CI.alpha = 0.05)
+
+SCIPAC.res
+```
+
+
+```{r}
+seurat_obj@meta.data = seurat_obj@meta.data %>%
+  rownames_to_column("cell_id") %>%
+  left_join(
+    SCIPAC.res %>% rownames_to_column("cell_id") %>% select(cell_id, Lambda.est,  Lambda.upper, Lambda.lower, sig, log.pval)
+  ) %>%
+  column_to_rownames("cell_id")
+```
+
+
+```{r}
+p = DimPlot(seurat_obj,
+        group.by = "sig",
+        cols = c("#ededed")) + NoLegend()
+p
+```
+
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/SCPCP000002", filename= "LGPT_SCIPAC.pdf", width=5.1, height=5.1, dpi=700)
+```
+
+
+```{r}
+p = DimPlot(seurat_obj, label = T,  label.size = 7, pt.size = .1, cols = c('#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf')) + NoLegend()
+p
+```
+
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/SCPCP000002", filename= "LGPT_UMAP.pdf", width=5.1, height=5, dpi=700)
+```

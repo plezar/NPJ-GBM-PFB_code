@@ -1,0 +1,346 @@
+---
+title: "Rabadan_PD1"
+author: "Maksym"
+date: "2/27/2023"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(edgeR)
+library(readr)
+```
+
+Preprocessing count data
+```{r}
+count_mtx = read_csv("/Volumes/TOSHIBA/TIMElab/Rabadan_PD1/ReadCount_matrix.csv")
+count_mtx = as.data.frame(count_mtx)
+
+rownames(count_mtx) <- count_mtx$...1
+count_mtx$...1 <- NULL
+count_mtx
+
+# Changing some colnames to match metadata
+count_data_colnames = colnames(count_mtx)
+count_data_colnames[count_data_colnames == "4626_D2"] <- "4626-D2"
+colnames(count_mtx) = count_data_colnames
+```
+
+Metadata
+```{r}
+metadata = read_csv("/Volumes/TOSHIBA/TIMElab/Rabadan_PD1/metadata.csv")
+metadata = as.data.frame(metadata)
+rownames(metadata) = metadata$sample_id
+metadata$sample_id = NULL
+
+joint_samples = intersect(colnames(count_mtx), rownames(metadata))
+
+metadata = metadata[joint_samples,]
+count_mtx = count_mtx[,joint_samples]
+```
+
+Joining additional clinical data
+
+```{r}
+additional_metadata = read_csv("/Volumes/TOSHIBA/TIMElab/Rabadan_PD1/clinical_data.csv")
+metadata = metadata %>% left_join(additional_metadata, "patient_id")
+```
+
+
+Normalization
+```{r}
+dge = DGEList(counts=count_mtx,
+             samples=metadata)
+
+keep = filterByExpr(dge)
+dge = dge[keep,,keep.lib.sizes=FALSE]
+dge = calcNormFactors(dge, method = "TMM")
+dge$cpm = cpm(dge, log=T)
+```
+
+MDS
+```{r}
+plotMDS(dge)
+```
+
+
+
+
+### Subtype calling
+
+
+
+```{r}
+sigs = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+```
+
+```{r}
+library(scrabble)
+library(ComplexHeatmap)
+
+sigs$ECMhi = sigs$ECMhi[sigs$ECMhi%in%rownames(dge$cpm)]
+sigs$ECMlo = sigs$ECMlo[sigs$ECMlo%in%rownames(dge$cpm)]
+
+sig_scores = scrabble::score(
+  mat = dge$cpm,
+  groups = sigs
+)
+
+dge$samples$ECMhi.score = sig_scores[,"ECMhi"]
+dge$samples$ECMlo.score = sig_scores[,"ECMlo"]
+
+hcl_obj = hclust(dist(sig_scores))
+cluster_calls = cutree(hcl_obj, k=2)
+
+Heatmap(t(sig_scores),
+        cluster_columns = hcl_obj,
+        column_split = 2)
+```
+
+```{r}
+score_threshold = 0
+
+dge$samples$ECM.cluster = sig_scores %>%
+  as.data.frame() %>%
+  mutate(ECM.cluster = if_else(ECMhi > score_threshold & ECMlo < -(score_threshold), "ECMhi",
+                               if_else(ECMhi < (-score_threshold) & ECMlo > score_threshold, "ECMlo", "undefined"))) %>%
+  pull(ECM.cluster)
+
+Heatmap(t(sig_scores),
+        column_split = factor(dge$samples$ECM.cluster))
+```
+
+```{r}
+saveRDS(dge, "/Volumes/TOSHIBA/TIMElab/Rabadan_PD1/DGEList.rds")
+```
+
+
+```{r}
+library(rstatix)
+library(ggpubr)
+library(cowplot)
+
+stat.test <- dge$samples %>%
+  filter(ECM.cluster != "undefined") %>%
+  t_test(ECMlo.score ~ response) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "response") %>%
+  mutate(y.position = y.position+.5)
+
+p = ggviolin(dge$samples %>%
+  filter(ECM.cluster != "undefined"),
+          x = "response",
+          y = "ECMlo.score",
+          add = c("boxplot", "jitter"),
+          color = "response",
+          #palette = palette_ECM_subtype,
+          outlier.shape = NA,
+          width = 0.6) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="ECMlo score") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .5
+p$layers[[idx]]$aes_params$alpha <- 1
+p
+```
+
+```{r}
+stat.test <- dge$samples %>%
+  filter(ECM.cluster != "undefined") %>%
+  t_test(ECMhi.score ~ response) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "response") %>%
+  mutate(y.position = y.position+.5)
+
+p = ggviolin(dge$samples %>%
+  filter(ECM.cluster != "undefined"),
+          x = "response",
+          y = "ECMhi.score",
+          add = c("boxplot", "jitter"),
+          color = "response",
+          #palette = palette_ECM_subtype,
+          outlier.shape = NA,
+          width = 0.6) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="ECMhi score") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .5
+p$layers[[idx]]$aes_params$alpha <- 1
+p
+```
+
+### CAF signatures
+
+```{r}
+caf_markers = read_tsv("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/muralcell/markers_FB-like_vs_ALL.tsv")
+
+caf_markers = caf_markers %>%
+  dplyr::filter(pct.1 > .5, avg_log2FC > 1) %>%
+  arrange(desc(avg_log2FC)) %>%
+  filter(gene %in% rownames(dge)) %>%
+  head(50) %>%
+  pull(gene)
+```
+
+
+Scoring
+```{r}
+sig_scores = scrabble::score(
+  mat = dge$cpm,
+  groups = list("CAF" = caf_markers),
+  #replace = T
+)
+dge$samples$CAF_score <- sig_scores[,"CAF"]
+```
+
+```{r}
+dge$samples$CAF_score_assignment <- NA
+dge$samples$CAF_score_assignment[sig_scores <= 0] <- "low"
+dge$samples$CAF_score_assignment[sig_scores > 0] <- "high"
+
+table(dge$samples$CAF_score_assignment)
+```
+
+```{r}
+table(dge$samples$response, dge$samples$CAF_score_assignment)
+```
+
+
+
+```{r}
+plot_data = dge$samples %>% rownames_to_column("sample_id")
+plot_data$response = factor(plot_data$response, levels = c("Yes", "No"))
+levels(plot_data$response) = c("Resp", "Nonresp")
+
+stat.test <- plot_data %>%
+  t_test(CAF_score ~ response) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "response") %>%
+  mutate(y.position = y.position+1.5)
+
+p = ggviolin(plot_data,
+          x = "response",
+          y = "CAF_score",
+          add = c("boxplot", "jitter"),
+          color = "response",
+          palette = c("#00A087FF", "#DC0000FF"),
+          outlier.shape = NA,
+          width = 0.6) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="CAF score", x=NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .5
+p$layers[[idx]]$aes_params$alpha <- 1
+p
+```
+```{r, eval=F}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures/FIG2", filename= "Rabadan_CAF_score_response.pdf", width=3.2, height=3, dpi = 700)
+```
+
+
+
+```{r}
+ggscatter(dge$samples, x = "ECMhi.score", y = "CAF_score",
+   color = "response")
+```
+Mean and SD over surgeries
+```{r}
+plot_data = dge$samples %>%
+  group_by(surgery_ordinal, response) %>%
+  summarise(CAF_score_mean = mean(CAF_score), CAF_score_sd = sd(CAF_score))
+
+ggplot(plot_data, aes(x=surgery_ordinal, y=CAF_score_mean, group=response, color=response)) + 
+  geom_line()+
+  geom_errorbar(aes(ymin=CAF_score_mean-CAF_score_sd, ymax=CAF_score_mean+CAF_score_sd), width=.2, position=position_dodge(0.1))
+```
+
+Mean and SD over treatment
+```{r}
+plot_data = dge$samples %>%
+  group_by(treatment, response) %>%
+  summarise(CAF_score_mean = mean(CAF_score), CAF_score_sd = sd(CAF_score))
+plot_data$treatment = factor(plot_data$treatment, levels = c("pre-treatment", "post-treatment"))
+
+ggplot(plot_data, aes(x=treatment, y=CAF_score_mean, group=response, color=response)) + 
+  geom_point()+
+  geom_line()+
+  geom_errorbar(aes(ymin=CAF_score_mean-CAF_score_sd, ymax=CAF_score_mean+CAF_score_sd), width=.1, position=position_dodge(0.01))
+```
+
+
+Individual samples over surgeries
+```{r}
+plot_data = dge$samples
+plot_data$patient_id = as.factor(plot_data$patient_id)
+
+ggplot(plot_data, aes(x=surgery_ordinal, y=CAF_score, group=patient_id)) +
+  geom_line(aes(color=response))+
+  geom_point(aes(color=response))
+```
+
+
+
+```{r}
+plot_data = dge$samples
+plot_data$patient_id = as.factor(plot_data$patient_id)
+
+ggplot(plot_data, aes(x=surgery_ordinal, y=CAF_score, group=patient_id)) +
+  geom_line(aes(color=treatment))+
+  geom_point(aes(color=treatment))
+```
+
+Survival analysis
+
+```{r}
+library(survminer)
+library(survival)
+
+col_bulk_subtype = c("ECMhi" = "#E64B35FF", "ECMlo" = "#4DBBD5FF")
+
+surv_data = dge$samples
+
+p1 = ggsurvplot(
+  survfit(Surv(PFS, deceased) ~ CAF_score_assignment, data=surv_data), pval=T, risk.table=F, tables.height=.4, palette = c("#E64B35FF", "#4DBBD5FF"), legend="none", ylab="PFS (%)", xlab = "Time (months)")
+
+p2 = ggsurvplot(
+  survfit(Surv(PFS.from.PD1, deceased) ~ CAF_score_assignment, data=surv_data), pval=T, risk.table=F, tables.height=.4, legend="none", ylab="PFS from PD1i (%)", xlab = "Time (days)", palette = c("#E64B35FF", "#4DBBD5FF"))
+
+p3 = ggsurvplot(
+  survfit(Surv(OS.from.PD1, deceased) ~ CAF_score_assignment, data=surv_data), pval=T, risk.table=F, tables.height=.4, legend="none", ylab="OS from PD1i (%)",xlab = "Time (days)", palette = c("#E64B35FF", "#4DBBD5FF"))
+
+p4 = ggsurvplot(
+  survfit(Surv(OS.2, deceased) ~ CAF_score_assignment, data=surv_data), pval=T, risk.table=F, tables.height=.4, legend="none", ylab="OS (%)", xlab = "Time (months)", palette = c("#E64B35FF", "#4DBBD5FF"))
+```
+
+```{r}
+pdf("/Volumes/TOSHIBA/TIMElab/figures/FIG2/Rabadan_CAF_PFS.pdf", width=3.5, height=2.5)
+print(p1, newpage = FALSE)
+dev.off()
+
+pdf("/Volumes/TOSHIBA/TIMElab/figures/FIG2/Rabadan_CAF_PFS.PD1.pdf", width=3.5, height=2.5)
+print(p2, newpage = FALSE)
+dev.off()
+
+pdf("/Volumes/TOSHIBA/TIMElab/figures/FIG2/Rabadan_CAF_OS.PD1.pdf", width=3.5, height=2.5)
+print(p3, newpage = FALSE)
+dev.off()
+
+pdf("/Volumes/TOSHIBA/TIMElab/figures/FIG2/Rabadan_CAF_OS.pdf", width=3.5, height=2.5)
+print(p4, newpage = FALSE)
+dev.off()
+```

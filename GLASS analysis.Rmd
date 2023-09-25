@@ -1,0 +1,295 @@
+---
+title: "GLASS analysis"
+output: html_document
+date: "2023-08-14"
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readr)
+  library(SummarizedExperiment)
+  library(edgeR)
+  library(biomaRt)
+})
+```
+
+## Data preprrocessing
+
+Reading data
+```{r}
+count_mtx = read_tsv("/Volumes/TOSHIBA/TIMElab/GLASS/transcript_count_matrix_all_samples.tsv")
+count_mtx$length = NULL
+
+metadata = read_tsv("/Volumes/TOSHIBA/TIMElab/GLASS/Job-298296446991737074423700472.tsv")
+biospecimen_sample_types = read_tsv("/Volumes/TOSHIBA/TIMElab/GLASS/biospecimen_sample_types.tsv") %>%
+  dplyr::select(-c(ROW_ID, ROW_VERSION))
+```
+
+Preparing metadata
+```{r}
+metadata_new = data.frame(Sample_name = colnames(count_mtx)[3:ncol(count_mtx)])
+metadata_new$sample_type = str_split(metadata_new$Sample_name, "-", Inf, T)[,4]
+metadata_new$sample_barcode = apply(str_split(metadata_new$Sample_name, "-", Inf, T)[,1:4], 1, paste0, collapse = "-")
+metadata_new = metadata_new %>%
+  left_join(
+    metadata, "sample_barcode"
+  ) %>%
+  left_join(
+    biospecimen_sample_types, "sample_type"
+  )
+```
+
+Converting ESEMBLEID to gene symbols
+```{r}
+mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+
+res <- getBM(attributes = c('ensembl_transcript_id', 
+                            'ensembl_gene_id', 
+                            'external_transcript_name',
+                            'external_gene_name'),
+             filters = 'ensembl_transcript_id', 
+             values = count_mtx$target_id,
+             mart = mart)
+
+res
+```
+
+```{r}
+count_mtx = res %>%
+  dplyr::select(target_id = ensembl_transcript_id, external_gene_name) %>%
+  left_join(count_mtx)
+```
+
+Summing transcript level counts to gene counts
+```{r}
+gene_count_mtx = count_mtx %>%
+  dplyr::select(-target_id) %>%
+  pivot_longer(!external_gene_name, names_to = "Sample", values_to = "Counts") %>%
+  group_by(Sample, external_gene_name) %>%
+  summarise(Gene.counts = sum(Counts)) %>%
+  filter(external_gene_name!="") %>%
+  pivot_wider(names_from = "Sample", values_from = "Gene.counts") %>%
+  column_to_rownames("external_gene_name")
+gene_count_mtx = as.matrix(gene_count_mtx)
+```
+
+Normalization
+```{r}
+dge = DGEList(counts=gene_count_mtx,
+               samples=metadata_new)
+
+keep = filterByExpr(dge)
+dge = dge[keep,,keep.lib.sizes=FALSE]
+dge = calcNormFactors(dge, method = "TMM")
+dge$cpm = cpm(dge, log=T)
+```
+
+PCA
+```{r}
+source("/Users/plezar/Documents/TIME-Lab/max/util.R")
+plot_PCA(dge$cpm,
+         dge$samples,
+         "red")
+```
+
+```{r}
+saveRDS(dge, "/Volumes/TOSHIBA/TIMElab/GLASS/DGEList.rds")
+```
+
+
+
+## ECM subtype calling
+
+```{r}
+sigs = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+dge = readRDS("/Volumes/TOSHIBA/TIMElab/GLASS/DGEList.rds")
+```
+
+```{r}
+library(scrabble)
+library(ComplexHeatmap)
+
+sigs$ECMhi = sigs$ECMhi[sigs$ECMhi%in%rownames(dge$cpm)]
+sigs$ECMlo = sigs$ECMlo[sigs$ECMlo%in%rownames(dge$cpm)]
+
+sig_scores = scrabble::score(
+  mat = dge$cpm,
+  groups = sigs
+)
+
+hcl_obj = hclust(dist(sig_scores))
+cluster_calls = cutree(hcl_obj, k=2)
+
+dge$samples$ECMhi.score = sig_scores[,1]
+dge$samples$ECMlo.score = sig_scores[,2]
+
+Heatmap(t(sig_scores),
+        cluster_columns = hcl_obj,
+        column_split = 2,
+        show_column_names = F)
+```
+
+
+```{r}
+score_threshold = 0
+
+dge$samples$ECM.cluster = sig_scores %>%
+  as.data.frame() %>%
+  mutate(ECM.cluster = if_else(ECMhi > score_threshold & ECMlo < -(score_threshold), "ECMhi",
+                               if_else(ECMhi < (-score_threshold) & ECMlo > score_threshold, "ECMlo", "ECMint"))) %>%
+  pull(ECM.cluster)
+
+Heatmap(t(sig_scores),
+        column_split = factor(dge$samples$ECM.cluster),
+        show_column_names = F)
+```
+
+```{r}
+saveRDS(dge, "/Volumes/TOSHIBA/TIMElab/GLASS/DGEList.rds")
+```
+
+
+
+## Analysis
+
+
+
+### DGE
+
+```{r, eval=F}
+wilcox_genomewide = function(count_norm, conditions) {
+  # 2nd level is ref (up or down with respect to 2nd level)
+  pvalues <- sapply(1:nrow(count_norm), function(i){
+  data <- cbind.data.frame(gene = as.numeric(t(count_norm[i,])), conditions)
+  p <- wilcox.test(gene~conditions, data)$p.value
+  return(p)
+  })
+  fdr <- p.adjust(pvalues, method = "fdr")
+  hist(pvalues)
+  
+  conditionsLevel <- levels(conditions)
+  dataCon1 <- count_norm[,c(which(conditions==conditionsLevel[2]))]
+  dataCon2 <- count_norm[,c(which(conditions==conditionsLevel[1]))]
+  FC <- rowMeans(dataCon2)/rowMeans(dataCon1)
+  
+  
+  outRst <- data.frame(FC = FC, p.value = pvalues, FDR = fdr) %>%
+    mutate(Log2FC = log2(abs(FC)),
+           Log2FC = ifelse(FC < 0, Log2FC*-1, Log2FC))
+  rownames(outRst) <- rownames(count_norm)
+  outRst <- na.omit(outRst)
+  outRst = outRst %>% arrange(FDR)
+  
+  return(outRst)
+}
+```
+
+
+```{r, eval=F}
+source("/Users/plezar/Documents/TIME-Lab/max/util.R")
+```
+
+DGE withing sample type
+
+```{r}
+for (i in c("TP", "R1", "R2", "R3")) {
+  smpl_ids = dge$samples %>%
+    filter(ECM.cluster!="ECMint") %>%
+    filter(sample_type==i) %>%
+    rownames()
+  
+  wilcox_result = wilcox_genomewide(dge$cpm[,smpl_ids], factor(dge$samples[smpl_ids,]$ECM.cluster, levels = c("ECMhi", "ECMlo")))
+  write.table(wilcox_result, file = paste0("/Volumes/TOSHIBA/TIMElab/GLASS/DGE/wilcox_result_", i, ".tsv"))
+  
+  clusterProfiler_GO_quick(rownames(filter(wilcox_result, FDR<.001, Log2FC>(+0.1))),
+                           rownames(wilcox_result),
+                           paste0("/Volumes/TOSHIBA/TIMElab/GLASS/DGE/GO/", i),
+                           "ECMhi_test")
+  
+  clusterProfiler_GO_quick(rownames(filter(wilcox_result, FDR<.001, Log2FC<(-0.1))),
+                           rownames(wilcox_result),
+                           paste0("/Volumes/TOSHIBA/TIMElab/GLASS/DGE/GO/", i),
+                           "ECMlo_test")
+}
+```
+
+
+```{r}
+i = "TP"
+smpl_ids = dge$samples %>%
+  filter(ECM.cluster!="ECMint") %>%
+  filter(sample_type==i) %>%
+  rownames()
+
+wilcox_result = wilcox_genomewide(dge$cpm[,smpl_ids], factor(dge$samples[smpl_ids,]$ECM.cluster, levels = c("ECMhi", "ECMlo")))
+write.table(wilcox_result, file = paste0("/Volumes/TOSHIBA/TIMElab/GLASS/DGE/wilcox_result_", i, ".tsv"))
+
+p1 = clusterProfiler_GO_quick(rownames(filter(wilcox_result, FDR<.001, Log2FC>(+0.1))),
+                         rownames(wilcox_result),
+                         paste0("/Volumes/TOSHIBA/TIMElab/GLASS/DGE/GO/", i),
+                         "ECMhi_test")
+
+p2 = clusterProfiler_GO_quick(rownames(filter(wilcox_result, FDR<.001, Log2FC<(-0.1))),
+                         rownames(wilcox_result),
+                         paste0("/Volumes/TOSHIBA/TIMElab/GLASS/DGE/GO/", i),
+                         "ECMlo_test")
+```
+
+```{r}
+ggsave(p1 + scale_x_continuous(breaks=c(0, 0.05, .1)), path="/Volumes/TOSHIBA/TIMElab/figures/FIG1/", filename= "ECMhi_GO_GLASS.pdf", width=5.5, height=4, dpi = 700)
+ggsave(p2 + scale_x_continuous(breaks=c(0, 0.05, .1)), path="/Volumes/TOSHIBA/TIMElab/figures/FIG1/", filename= "ECMlo_GO_GLASS.pdf", width=6, height=4, dpi = 700)
+```
+
+
+Comparing scores longitudinally
+
+```{r}
+library(ggpubr)
+
+paired_ecmhi_scores_d = dge$samples %>% 
+  filter(sample_type %in% c("TP", "R1")) %>%
+  dplyr::select(case_barcode, sample_barcode, sample_type, ECMhi.score) %>%
+  group_by(sample_barcode) %>% mutate(Count = n()) %>% filter(Count == 1) %>% ungroup() %>% dplyr::select(-c(Count, sample_barcode)) %>%
+  pivot_wider(names_from = sample_type, values_from = ECMhi.score) %>% drop_na()
+
+ggpaired(paired_ecmhi_scores_d, cond1 = "TP", cond2 = "R1",
+         color = "condition", line.color = "gray", line.size = 0.4,
+         palette = "jco")+
+  stat_compare_means(paired = TRUE)
+```
+
+
+```{r}
+dge$samples$sample_type_short = factor(substr(dge$samples$sample_type, 1, 1))
+levels(dge$samples$sample_type_short) = c("R", "P")
+```
+
+```{r}
+d = dge$samples %>%
+  group_by(sample_type, ECM.cluster) %>%
+  summarise(Count = n()) %>%
+  filter(sample_type != "R4") %>%
+  mutate(Prop = Count/sum(Count))
+
+d$sample_type = factor(d$sample_type, levels = c("TP", "R1", "R2", "R3"))
+d$ECM.cluster = factor(d$ECM.cluster, levels = c("ECMhi", "ECMlo", "ECMint"))
+
+p = ggplot(d, aes(fill=ECM.cluster, y=Count, x=sample_type, label = Prop)) + 
+  geom_bar(position="fill", stat="identity") +
+  scale_fill_manual(values = c(palette_ECM_subtype, "ECMint" = "#c5c5c5")) +
+  theme_cowplot() +
+  labs(x = NULL, y = "Fraction")
+
+p
+```
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures/FIG1/Supplement/", filename= "GLASS_ECM_Subtype_recurrence.pdf", width=4.6*.9, height=3.2*.9, dpi = 700)
+```
+
+
+
+```{r}
+dge$samples
+```
+

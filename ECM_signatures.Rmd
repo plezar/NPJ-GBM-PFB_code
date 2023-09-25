@@ -1,0 +1,4041 @@
+---
+title: "ECM signatures"
+author: "Maksym"
+date: "8/4/2022"
+output: html_document
+---
+
+
+```{r}
+library(NMF)
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(ggpubr)
+library(RColorBrewer)
+library(survminer)
+library(survival)
+library(SummarizedExperiment)
+source("util.R")
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/"
+matrisome_geneset = readLines("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/matrisome_geneset.txt")
+```
+
+
+Reading data
+```{r}
+tcga_GBM_Env = new.env()
+tcga_LGG_Env = new.env()
+cgga693Env = new.env()
+cgga325Env = new.env()
+```
+
+```{r}
+cgga693Env$DGEList = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/CGGA693_DGEList.rds")
+cgga325Env$DGEList = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/CGGA325_DGEList.rds")
+tcga_GBM_Env$DGEList  = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA_GBM_DGEList.rds")
+tcga_LGG_Env$DGEList = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA_LGG_DGEList.rds")
+```
+
+
+## Merging objects
+
+Merging count data
+```{r}
+overlapping_genes = intersect(intersect(rownames(cgga693Env$DGEList$counts), rownames(cgga325Env$DGEList$counts)), rownames(tcgaEnv$DGEList$counts))
+edata_counts_merged = cbind(cgga693Env$DGEList$counts[overlapping_genes,],
+      cgga325Env$DGEList$counts[overlapping_genes,],
+      tcgaEnv$DGEList$counts[overlapping_genes,])
+```
+
+Merging expression data
+```{r}
+overlapping_genes = intersect(intersect(rownames(cgga693Env$DGEList$cpm), rownames(cgga325Env$DGEList$cpm)), rownames(tcgaEnv$DGEList$cpm))
+edata_merged = cbind(cgga693Env$DGEList$cpm[overlapping_genes,],
+      cgga325Env$DGEList$cpm[overlapping_genes,],
+      tcgaEnv$DGEList$cpm[overlapping_genes,])
+```
+
+
+Merging coldata
+
+```{r}
+cgga325_coldata = cgga325Env$DGEList$samples %>% dplyr::select(Group = PRS_type, Grade, OS, Radio = Radio_status..treated.1.un.treated.0., Chemo = Chemo_status..TMZ.treated.1.un.treated.0., IDH_mutation_status, Deceased = Censor..alive.0..dead.1., Gender) %>% filter(Grade == "WHO IV")
+
+cgga693_coldata = cgga693Env$DGEList$samples %>% dplyr::select(Group = PRS_type, Grade, OS, Radio = Radio_status..treated.1.un.treated.0., Chemo = Chemo_status..TMZ.treated.1.un.treated.0., IDH_mutation_status, Deceased = Censor..alive.0..dead.1., Gender) %>% filter(Grade == "WHO IV")
+
+tcga_coldata = tcgaEnv$DGEList$samples %>% 
+  # create an "overall survival" variable that is equal to days_to_death
+  # for dead patients, and to days_to_last_follow_up for patients who
+  # are still alive
+  dplyr::mutate(OS = if_else(vital_status == "Dead",
+                     days_to_death,
+                     days_to_last_follow_up)) %>%
+  dplyr::select(Group = sample_type, Deceased = vital_status, Grade = paper_Grade, OS, IDH_mutation_status = paper_IDH.status, Gender = gender) %>%
+  filter(Group != "Solid Tissue Normal")
+
+tcga_coldata$Group = as.factor(tcga_coldata$Group)
+levels(tcga_coldata$Group) = c("Primary", "Recurrent")
+tcga_coldata$Group = as.character(tcga_coldata$Group)
+
+tcga_coldata$Deceased = as.factor(tcga_coldata$Deceased)
+levels(tcga_coldata$Deceased) = c(0, 1, NA)
+tcga_coldata$Deceased = as.numeric(tcga_coldata$Deceased)
+
+tcga_coldata$Grade = as.factor(tcga_coldata$Grade)
+levels(tcga_coldata$Grade) = c("WHO II", "WHO III", "WHO IV")
+tcga_coldata$Grade = as.character(tcga_coldata$Grade)
+
+tcga_coldata$IDH_mutation_status = as.factor(tcga_coldata$IDH_mutation_status)
+levels(tcga_coldata$IDH_mutation_status) = c("Mutant", "Wildtype")
+tcga_coldata$IDH_mutation_status = as.character(tcga_coldata$IDH_mutation_status)
+
+tcga_coldata$Gender = as.factor(tcga_coldata$Gender)
+levels(tcga_coldata$Gender) = c("Female", "Male")
+tcga_coldata$Gender = as.character(tcga_coldata$Gender)
+
+coldata_merged = bind_rows(tcga_coldata %>% mutate(Batch = "TCGA"),
+                           cgga325_coldata %>% mutate(Batch = "CGGA325"),
+                           cgga693_coldata %>% mutate(Batch = "CGGA693"))
+```
+
+Subsetting expression matrix
+```{r}
+edata_merged = edata_merged[,rownames(coldata_merged)]
+edata_counts_merged = edata_counts_merged[,rownames(coldata_merged)]
+```
+
+Creating an SE object
+```{r}
+se = SummarizedExperiment(assays = list(cpm = log2(edata_merged+0.0001)), colData = coldata_merged)
+```
+
+
+
+Saving a count data with coldata from a finalized obbject that includes ECM cluster calls
+```{r}
+se = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA-CGGA-SummarizedExperiment.rds")
+se_counts = SummarizedExperiment(assays = list(counts = edata_counts_merged), colData = colData(se))
+saveRDS(se_counts, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA-CGGA-COUNTS-SummarizedExperiment.rds")
+```
+
+```{r}
+library(NMF)
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(ggpubr)
+library(RColorBrewer)
+library(survminer)
+library(survival)
+library(SummarizedExperiment)
+source("util.R")
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/"
+matrisome_geneset = readLines("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/matrisome_geneset.txt")
+```
+
+
+Reading data
+```{r}
+tcgaEnv = new.env()
+cgga693Env = new.env()
+cgga325Env = new.env()
+```
+
+```{r}
+cgga693Env$DGEList = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/CGGA693_DGEList.rds")
+cgga325Env$DGEList = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/CGGA325_DGEList.rds")
+tcgaEnv$DGEList  = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA_GBM_DGEList.rds")
+```
+
+
+## Merging objects (ALL grades)
+
+Merging count data
+```{r}
+overlapping_genes = intersect(
+  intersect(
+  intersect(
+    rownames(cgga693Env$DGEList$counts), rownames(cgga325Env$DGEList$counts)
+    ),
+  rownames(tcga_GBM_Env$DGEList$counts)
+  ),
+  rownames(tcga_LGG_Env$DGEList$counts))
+
+edata_counts_merged = cbind(cgga693Env$DGEList$counts[overlapping_genes,],
+      cgga325Env$DGEList$counts[overlapping_genes,],
+      tcga_GBM_Env$DGEList$counts[overlapping_genes,],
+      tcga_LGG_Env$DGEList$counts[overlapping_genes,])
+```
+
+Merging expression data
+```{r}
+overlapping_genes = intersect(
+  intersect(
+  intersect(
+    rownames(cgga693Env$DGEList$cpm), rownames(cgga325Env$DGEList$cpm)
+    ),
+  rownames(tcga_GBM_Env$DGEList$cpm)
+  ),
+  rownames(tcga_LGG_Env$DGEList$cpm))
+
+edata_merged = cbind(cgga693Env$DGEList$cpm[overlapping_genes,],
+      cgga325Env$DGEList$cpm[overlapping_genes,],
+      tcga_GBM_Env$DGEList$cpm[overlapping_genes,],
+      tcga_LGG_Env$DGEList$cpm[overlapping_genes,])
+```
+
+Merging coldata
+
+Merging histologies
+
+```{r}
+cgga_histologies = data.frame("Histology" = c("LGG", "GBM", "A", "O", "OA", "AOA", "AA", "rGBM", "rAA", "rA", "AO", "rAO", "rO", "rAOA"),
+"New_histology" = c("Lower-grade glioma", "Glioblastoma", "Astrocytoma", "Oligodendroglioma", "Oligoastrocytoma", "Anaplastic oligoastrocytoma", "Anaplastic astrocytoma", "Glioblastoma", "Anaplastic astrocytoma", "Astrocytoma", "Anaplastic oligodendroglioma", "Anaplastic oligodendroglioma", "Oligodendroglioma", "Anaplastic oligoastrocytoma"))
+
+tcga_histologies = data.frame("primary_diagnosis" = c("Astrocytoma, NOS", "Oligodendroglioma, NOS", "Astrocytoma, anaplastic", "Oligodendroglioma, anaplastic", "Mixed glioma"),
+"New_histology" = c("Astrocytoma", "Oligodendroglioma", "Anaplastic astrocytoma", "Anaplastic oligodendroglioma", "Oligoastrocytoma"))
+```
+
+```{r}
+cgga325_coldata = cgga325Env$DGEList$samples %>%
+  rownames_to_column() %>%
+  dplyr::select(Group = PRS_type, Grade, OS, Radio = Radio_status..treated.1.un.treated.0., Chemo = Chemo_status..TMZ.treated.1.un.treated.0., IDH_mutation_status, Deceased = Censor..alive.0..dead.1., Gender, Histology, rowname) %>%
+  left_join(cgga_histologies, "Histology") %>%
+  select(-Histology) %>%
+  dplyr::rename(Histology = New_histology) %>%
+  column_to_rownames()
+
+cgga693_coldata = cgga693Env$DGEList$samples %>%
+  rownames_to_column() %>%
+  dplyr::select(Group = PRS_type, Grade, OS, Radio = Radio_status..treated.1.un.treated.0., Chemo = Chemo_status..TMZ.treated.1.un.treated.0., IDH_mutation_status, Deceased = Censor..alive.0..dead.1., Gender, Histology, rowname) %>%
+  left_join(cgga_histologies, "Histology") %>%
+  select(-Histology) %>%
+  dplyr::rename(Histology = New_histology) %>%
+  column_to_rownames()
+
+tcga_GBM_coldata = tcga_GBM_Env$DGEList$samples %>% 
+  dplyr::mutate(OS = if_else(vital_status == "Dead",
+                     days_to_death,
+                     days_to_last_follow_up)) %>%
+  dplyr::select(Group = sample_type, Deceased = vital_status, Grade = paper_Grade, OS, IDH_mutation_status = paper_IDH.status, Gender = gender, Histology = primary_diagnosis) %>%
+  filter(Group != "Solid Tissue Normal")
+
+tcga_LGG_coldata = tcga_LGG_Env$DGEList$samples %>%
+  rownames_to_column() %>%
+  dplyr::mutate(OS = if_else(vital_status == "Dead",
+                     days_to_death,
+                     days_to_last_follow_up)) %>%
+  dplyr::select(Group = sample_type, Deceased = vital_status, Grade = paper_Grade, OS, IDH_mutation_status = paper_IDH.status, Gender = gender, primary_diagnosis, rowname) %>%
+  filter(Group != "Solid Tissue Normal")  %>%
+  left_join(tcga_histologies, "primary_diagnosis") %>%
+  select(-primary_diagnosis) %>%
+  dplyr::rename(Histology = New_histology) %>%
+  column_to_rownames()
+
+tcga_GBM_coldata$Group = as.factor(tcga_GBM_coldata$Group)
+levels(tcga_GBM_coldata$Group) = c("Primary", "Recurrent")
+tcga_GBM_coldata$Group = as.character(tcga_GBM_coldata$Group)
+
+tcga_GBM_coldata$Deceased = as.factor(tcga_GBM_coldata$Deceased)
+levels(tcga_GBM_coldata$Deceased) = c(0, 1, NA)
+tcga_GBM_coldata$Deceased = as.numeric(as.character(tcga_GBM_coldata$Deceased))
+
+tcga_GBM_coldata$Grade = as.factor(tcga_GBM_coldata$Grade)
+levels(tcga_GBM_coldata$Grade) = c("WHO II", "WHO III", "WHO IV")
+tcga_GBM_coldata$Grade = as.character(tcga_GBM_coldata$Grade)
+
+tcga_GBM_coldata$IDH_mutation_status = as.factor(tcga_GBM_coldata$IDH_mutation_status)
+levels(tcga_GBM_coldata$IDH_mutation_status) = c("Mutant", "Wildtype")
+tcga_GBM_coldata$IDH_mutation_status = as.character(tcga_GBM_coldata$IDH_mutation_status)
+
+tcga_GBM_coldata$Gender = as.factor(tcga_GBM_coldata$Gender)
+levels(tcga_GBM_coldata$Gender) = c("Female", "Male")
+tcga_GBM_coldata$Gender = as.character(tcga_GBM_coldata$Gender)
+
+tcga_LGG_coldata$Group = as.factor(tcga_LGG_coldata$Group)
+levels(tcga_LGG_coldata$Group) = c("Primary", "Recurrent")
+tcga_LGG_coldata$Group = as.character(tcga_LGG_coldata$Group)
+
+tcga_LGG_coldata$Deceased = as.factor(tcga_LGG_coldata$Deceased)
+levels(tcga_LGG_coldata$Deceased) = c(0, 1, NA)
+tcga_LGG_coldata$Deceased = as.numeric(as.character(tcga_LGG_coldata$Deceased))
+
+tcga_LGG_coldata$Grade = as.factor(tcga_LGG_coldata$Grade)
+levels(tcga_LGG_coldata$Grade) = c("WHO II", "WHO III", "WHO IV")
+tcga_LGG_coldata$Grade = as.character(tcga_LGG_coldata$Grade)
+
+tcga_LGG_coldata$IDH_mutation_status = as.factor(tcga_LGG_coldata$IDH_mutation_status)
+levels(tcga_LGG_coldata$IDH_mutation_status) = c("Mutant", "Wildtype")
+tcga_LGG_coldata$IDH_mutation_status = as.character(tcga_LGG_coldata$IDH_mutation_status)
+
+tcga_LGG_coldata$Gender = as.factor(tcga_LGG_coldata$Gender)
+levels(tcga_LGG_coldata$Gender) = c("Female", "Male")
+tcga_LGG_coldata$Gender = as.character(tcga_LGG_coldata$Gender)
+
+coldata_merged = bind_rows(tcga_GBM_coldata %>% mutate(Batch = "TCGA_GBM"),
+                           tcga_LGG_coldata %>% mutate(Batch = "TCGA_LGG"),
+                           cgga325_coldata %>% mutate(Batch = "CGGA325"),
+                           cgga693_coldata %>% mutate(Batch = "CGGA693"))
+```
+
+Subsetting expression matrix
+```{r}
+edata_merged = edata_merged[,rownames(coldata_merged)]
+edata_counts_merged = edata_counts_merged[,rownames(coldata_merged)]
+```
+
+Creating an SE object
+```{r}
+se = SummarizedExperiment(assays = list(cpm = log2(edata_merged+0.0001)), colData = coldata_merged)
+```
+
+
+
+## Wang subtypes
+
+Writing input files for gliovis tool (http://gliovis.bioinfo.cnio.es/)
+```{r, eval=F}
+d = t(cgga693Env$DGEList$cpm[,cgga693Env$DGEList$samples$Grade=="WHO IV"]) %>%
+  as.data.frame() %>%
+  drop_na() %>%
+  rownames_to_column("Sample")
+write.table(d, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/wang_subtyping/CGGA693.csv", sep=",", quote = F, row.names = F)
+
+d = t(cgga325Env$DGEList$cpm[,cgga325Env$DGEList$samples$Grade=="WHO IV"]) %>%
+  as.data.frame() %>%
+  drop_na() %>%
+  rownames_to_column("Sample")
+write.table(d, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/wang_subtyping/CGGA325.csv", sep=",", quote = F, row.names = F)
+
+d = t(tcgaEnv$DGEList$cpm) %>%
+  as.data.frame() %>%
+  rownames_to_column("Sample")
+write.table(d, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/wang_subtyping/TCGA_GBM.csv", sep=",", quote = F, row.names = F)
+```
+
+Reading output files
+```{r}
+wang_calls = rbind(
+  read.table("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/wang_subtyping/CGGA325_Wang.csv", sep=",", header = T),
+  read.table("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/wang_subtyping/CGGA693_Wang.csv", sep=",", header = T),
+  read.table("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/wang_subtyping/TCGA_Wang.csv", sep=",", header = T)
+)
+
+wang_calls = wang_calls %>% dplyr::rename("Sample" = "X", "Subtype" = "gsea.subtype.call") %>% dplyr::select(Sample, Subtype)
+wang_calls$Sample = gsub("\\.", "-", wang_calls$Sample)
+```
+
+```{r}
+colData(se)$Subtype = colData(se) %>%
+  as.data.frame() %>%
+  rownames_to_column("Sample") %>%
+  left_join(wang_calls, "Sample") %>%
+  pull(Subtype)
+```
+
+
+## Batch correction
+
+PCA
+```{r}
+source("util.R")
+var_features = names(sort(apply(assay(se), 1, var), decreasing = T)[1:1000])
+p = plot_PCA(assay(se)[var_features,],
+         as.data.frame(colData(se)),
+         "Batch")
+p
+```
+```{r}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG1/Supplement/"
+ggsave(p, path=fig_path, filename= "pca_uncorrected.pdf", width=5.5, height=4, dpi = 700)
+```
+
+
+Batch correction
+```{r}
+library(limma)
+assay(se, 2) = limma::removeBatchEffect(assay(se),
+                                         batch = colData(se)$Batch)
+```
+
+```{r}
+var_features = names(sort(apply(assay(se, 2), 1, var), decreasing = T)[1:1000])
+p = plot_PCA(assay(se, 2)[var_features,],
+         as.data.frame(colData(se)),
+         "Batch")
+p
+```
+
+```{r}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG1/Supplement/"
+ggsave(p, path=fig_path, filename= "pca_corrected.pdf", width=5.5, height=4, dpi = 700)
+```
+
+
+```{r, eval=F}
+saveRDS(se, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA-CGGA-ALL-GRADES-SummarizedExperiment.rds")
+View(coldata_merged)
+```
+
+
+## Matrisome data
+```{r}
+matrisome_d = readxl::read_xlsx("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/matrisome_hs_masterlist.xlsx")
+core_matrisome_d = matrisome_d %>% filter(Division=="Core matrisome")
+matrisome_geneset = intersect(core_matrisome_d$`Gene Symbol`, rownames(se))
+writeLines(matrisome_geneset, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/matrisome_geneset.txt")
+```
+
+
+
+## NMF
+
+```{r}
+se = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA-CGGA-SummarizedExperiment.rds")
+```
+
+### Optimization
+
+Centering data
+```{r}
+filtered = assay(se, 2)[apply(assay(se, 2), 1, mad) > .5,]
+centered = sweep(filtered,1, apply(filtered,1,mean,na.rm=T))
+centered = centered[rownames(centered)%in%matrisome_geneset,]
+centered_non_negative = centered-min(centered)
+
+write.table(as.data.frame(centered_non_negative), "/Users/plezar/Desktop/TCGA-CGGA-corrected.tsv")
+```
+
+
+NMF optimization was run on CRC cluster using nmf_CRC.R script:
+```{r}
+nmf_optim_res = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/nmf_merged_optim.rds")
+```
+
+```{r}
+p = plot(nmf_optim_res)
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures", filename= "NMF_optimization.pdf", width=6, height=4, dpi = 700)
+```
+
+
+### K=2
+
+```{r,eval=F}
+nmf_res = nmf(centered_non_negative, 2, nrun=50, seed=42, .pbackend = "par")
+saveRDS(nmf_res, file = "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/nmf.k2.rds")
+```
+
+```{r}
+nmf_res = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/nmf.k2.rds")
+```
+
+```{r}
+pdf("/Volumes/TOSHIBA/TIMElab/figures/FIG1/NMF_consensusmap.pdf", width = 5, height = 4)
+consensusmap(nmf_res, cexCol=0, cexRow=0, tracks=c("silhouette"))
+dev.off()
+```
+
+Classifying samples for which silhouette coefficient is greater than 0
+```{r}
+silh_coefs = silhouette(x = as.integer(predict(nmf_res)),
+         dist = dist(t(assay(se, 2)[matrisome_geneset,])), method="euclidean")
+
+predictions = data.frame(NMF.cluster = predict(nmf_res)) %>%
+  mutate(Core.sample = silh_coefs[,"sil_width"]>0)
+```
+
+
+## Hierarchical
+
+```{r}
+library(ConsensusClusterPlus)
+consensus_hclust = ConsensusClusterPlus(centered_non_negative,
+                                        maxK = 3,
+                                        seed=42,
+                                        innerLinkage="average",
+                                        plot= "pdf")
+
+```
+
+
+
+```{r}
+hclus_classification = consensus_hclust[[2]][["consensusClass"]]
+
+predictions = predictions %>%
+  rownames_to_column() %>%
+  left_join(
+    data.frame(Hclus.cluster = hclus_classification) %>% rownames_to_column()
+  )
+```
+
+```{r}
+colData(se)$Hclus.cluster = NULL
+colData(se)$Hclus.cluster = colData(se) %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  left_join(
+    predictions, by = "rowname"
+  ) %>%
+  column_to_rownames() %>%
+  pull(Hclus.cluster)
+
+colData(se)$NMF.cluster = NULL
+colData(se)$NMF.cluster = colData(se) %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  left_join(
+    predictions, by = "rowname"
+  ) %>%
+  column_to_rownames() %>%
+  pull(NMF.cluster)
+
+colData(se)$Core.sample = NULL
+colData(se)$Core.sample = colData(se) %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  left_join(
+    predictions, by = "rowname"
+  ) %>%
+  column_to_rownames() %>%
+  pull(Core.sample)
+```
+
+Fraction of samples classified as the same cluster
+```{r}
+mean(predictions$NMF.cluster == predictions$Hclus.cluster)
+```
+
+```{r, eval=F}
+saveRDS(se, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA-CGGA-SummarizedExperiment.rds")
+```
+
+
+
+
+
+### Correlation between different datasets
+
+```{r}
+sigscores_nmf = assay(se, 2)[matrisome_geneset,] %>%
+  as.data.frame() %>%
+  rownames_to_column("Gene") %>%
+  pivot_longer(!Gene, names_to = "Sample", values_to = "Expression") %>%
+  left_join(
+    colData(se) %>% as.data.frame() %>% select(NMF.cluster, Hclus.cluster) %>% rownames_to_column("Sample"),
+    "Sample"
+  ) %>%
+  drop_na(NMF.cluster) %>%
+  group_by(NMF.cluster, Gene) %>%
+  summarise(Mean_exp = mean(Expression)) %>%
+  ungroup() %>%
+  mutate(NMF.cluster = paste0("NMF-", NMF.cluster)) %>%
+  pivot_wider(names_from = "NMF.cluster", values_from = "Mean_exp")
+
+sigscores_hclus = assay(se, 2)[matrisome_geneset,] %>%
+  as.data.frame() %>%
+  rownames_to_column("Gene") %>%
+  pivot_longer(!Gene, names_to = "Sample", values_to = "Expression") %>%
+  left_join(
+    colData(se) %>% as.data.frame() %>% select(NMF.cluster, Hclus.cluster) %>% rownames_to_column("Sample"),
+    "Sample"
+  ) %>%
+  drop_na(Hclus.cluster) %>%
+  group_by(Hclus.cluster, Gene) %>%
+  summarise(Mean_exp = mean(Expression)) %>%
+  ungroup() %>%
+  mutate(Hclus.cluster = paste0("Hclus-", Hclus.cluster)) %>%
+  pivot_wider(names_from = "Hclus.cluster", values_from = "Mean_exp")
+
+sigscores = sigscores_nmf %>%
+  left_join(sigscores_hclus,
+            "Gene") %>%
+  column_to_rownames("Gene") %>%
+  as.matrix()
+  
+h1 = Heatmap(cor(sigscores, method = "spearman"),
+        #col = colorRamp2(seq(.8, 1, length.out=9), rev(brewer.pal(n=9, name="RdBu"))),
+        name = "Spearman correlation",
+        width = unit(6, "cm"),
+        height = unit(6, "cm"),
+        cell_fun = function(j, i, x, y, width, height, fill) {
+        grid.text(sprintf("%.3f", cor(sigscores, method = "spearman")[i, j]), x, y, gp = gpar(fontsize = 10))})
+
+h1
+```
+
+```{r}
+pdf(paste0(fig_path, "hclust_NMF_cor.pdf"), width = 6, height = 4)
+draw(h1)
+dev.off()
+```
+
+
+
+### Wilcoxon DE testing
+
+```{r, eval=F}
+wilcox_genomewide = function(count_norm, conditions) {
+  pvalues <- sapply(1:nrow(count_norm), function(i){
+  data <- cbind.data.frame(gene = as.numeric(t(count_norm[i,])), conditions)
+  p <- wilcox.test(gene~conditions, data)$p.value
+  return(p)
+  })
+  fdr <- p.adjust(pvalues, method = "fdr")
+  hist(pvalues)
+  
+  conditionsLevel <- levels(conditions)
+  dataCon1 <- count_norm[,c(which(conditions==conditionsLevel[2]))]
+  dataCon2 <- count_norm[,c(which(conditions==conditionsLevel[1]))]
+  FC <- rowMeans(dataCon2)/rowMeans(dataCon1)
+  
+  
+  outRst <- data.frame(FC = FC, p.value = pvalues, FDR = fdr) %>%
+    mutate(Log2FC = log2(abs(FC)),
+           Log2FC = ifelse(FC < 0, Log2FC*-1, Log2FC))
+  rownames(outRst) <- rownames(count_norm)
+  outRst <- na.omit(outRst)
+  outRst = outRst %>% arrange(FDR)
+  
+  return(outRst)
+}
+
+wilcox_result = lapply(c("CGGA325", "CGGA693", "TCGA"), function(x) {
+  se_sub = se[,colData(se)$Batch==x & colData(se)$Core.sample==T]
+  result  = wilcox_genomewide(assay(se_sub, 2), colData(se_sub)$NMF.cluster)
+  return(result)
+})
+
+wilcox_result
+```
+
+```{r, eval=F}
+saveRDS(wilcox_result, file = "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM.sign.wilcox.rds")
+```
+
+All merged datasets
+```{r}
+wilcox_result_merged  = wilcox_genomewide(assay(se, 2)-min(assay(se, 2)), colData(se)$NMF.cluster)
+saveRDS(wilcox_result_merged, file = "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM.sign.wilcox.merged.rds")
+```
+For all grades
+```{r}
+cond_vec = colData(se)$ECM.cluster[se$ECM.cluster!="mixed"]
+cond_vec = factor(cond_vec, levels = c("ECMhi", "ECMlo"))
+
+wilcox_result_merged  = wilcox_genomewide((assay(se, 2)-min(assay(se, 2)))[,se$ECM.cluster!="mixed"], cond_vec)
+```
+
+PCA on ECM genes
+```{r}
+library(cowplot)
+library(ggpubr)
+
+meta = as.data.frame(colData(se))
+
+var_features = names(sort(apply(assay(se, 2), 1, var), decreasing = T)[1:1000])
+
+PCA_raw <- prcomp(t(assay(se, 2)[rownames(se) %in% var_features,]), scale. = FALSE)
+percentVar <- round(100*PCA_raw$sdev^2/sum(PCA_raw$sdev^2),1)
+sd_ratio <- sqrt(percentVar[2] / percentVar[1])
+
+meta$PC1 = PCA_raw$x[,1]
+meta$PC2 = PCA_raw$x[,2]
+
+meta$ECM.cluster = factor(meta$ECM.cluster)
+levels(meta$ECM.cluster) = c("ECMhi", "ECMlo", "ECMint")
+
+
+p = ggplot(meta, aes(x = PC1, y = PC2, color = ECM.cluster)) +
+  stat_density_2d() +
+  scale_color_manual(values = c(palette_ECM_subtype, "ECMint" = "#c5c5c5")) +
+  theme_cowplot()
+
+p
+```
+
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures/FIG1/", filename= "PCA_ECM_genes.pdf", width=4.6*.9, height=3.2*.9, dpi = 700)
+```
+
+
+PCA on all matrisome
+```{r}
+matrisome_d = readxl::read_xlsx("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/matrisome_hs_masterlist.xlsx")
+```
+
+```{r}
+library(cowplot)
+library(ggpubr)
+
+meta = as.data.frame(colData(se))
+PCA_raw <- prcomp(t(assay(se, 2)[rownames(se) %in% matrisome_d$`Gene Symbol`,]), scale. = FALSE)
+percentVar <- round(100*PCA_raw$sdev^2/sum(PCA_raw$sdev^2),1)
+sd_ratio <- sqrt(percentVar[2] / percentVar[1])
+
+meta$PC1 = PCA_raw$x[,1]
+meta$PC2 = PCA_raw$x[,2]
+
+
+p = ggplot(meta, aes(x = PC1, y = PC2, color = ECM.cluster)) +
+  stat_density_2d(aes(alpha = ..piece..)) +
+  scale_color_manual(values = c(palette_ECM_subtype, "mixed" = "#c5c5c5")) +
+  theme_cowplot()
+
+p
+```
+```{r}
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures/FIG1/", filename= "PCA_matrisome.pdf", width=4.6*.9, height=3.2*.9, dpi = 700)
+```
+
+
+
+
+
+```{r}
+source("util.R")
+var_features = matrisome_geneset
+p = plot_PCA(assay(se, 2)[rownames(se) %in% var_features,],
+         as.data.frame(colData(se)),
+         "ECM.cluster")
+p
+```
+
+
+
+```{r}
+wilcox_result_merged = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM.sign.wilcox.merged.rds")
+```
+
+
+Renaming idents
+```{r}
+cluster_names = data.frame(
+  NMF.cluster = c(1, 2),
+  ECM.cluster = c("ECMhi", "ECMlo")
+)
+
+colData(se)$ECM.cluster = NULL
+colData(se)$ECM.cluster = colData(se) %>%
+  as.data.frame() %>%
+  mutate(NMF.cluster = as.numeric(NMF.cluster)) %>%
+  left_join(
+    cluster_names, by = c("NMF.cluster")
+  ) %>%
+  pull(ECM.cluster)
+```
+
+```{r, eval=F}
+saveRDS(se, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA-CGGA-SummarizedExperiment.rds")
+```
+
+
+### Cluster stability
+
+80% gene resampling
+```{r}
+library(ConsensusClusterPlus)
+consensus_hclust = ConsensusClusterPlus(centered_non_negative,
+                                        pItem = 1,
+                                        pFeature = 0.8,
+                                        reps = 20,
+                                        maxK = 3,
+                                        seed=42,
+                                        innerLinkage="average",
+                                        plot= NULL)
+
+```
+### P value rank plot
+
+```{r}
+library(tidyverse)
+library(ggrepel)
+library(cowplot)
+
+wilcox_result = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM.sign.wilcox.rds")
+names(wilcox_result) = c("CGGA325", "CGGA693", "TCGA")
+matrisome_geneset = readLines("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/matrisome_geneset.txt")
+```
+
+```{r}
+d = wilcox_result[[1]]
+d$Annotation = ifelse(rownames(d) %in% matrisome_geneset, "Core Matrisome", NA)
+d$Order = ifelse(rownames(d) %in% matrisome_geneset, 1, 2)
+
+d = d %>%
+  arrange(p.value)
+d$Rank = 1:nrow(d)
+d$Rank_fraction = d$Rank/nrow(d)
+d$Gene_name = ifelse(d$Annotation=="Core Matrisome", rownames(d), NA)
+d = d %>% filter(Log2FC>0)
+
+ggplot(d) +
+  geom_point(size = .05, aes(x=Rank_fraction, y=FDR, color = Annotation, order = Order)) +
+  geom_point(data = subset(d, Annotation == 'Core Matrisome'),
+             aes(x = Rank_fraction, y = FDR, color = Annotation),
+             size = .5) +
+  geom_hline(yintercept = 0.05, lty = 2) +
+  theme_cowplot() +
+  labs(x = "Rank Fraction", y = "FDR")
+```
+
+
+
+## Hypergeometric
+
+### ECM subtypes
+
+
+```{r}
+se = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA-CGGA-SummarizedExperiment.rds")
+```
+
+```{r}
+col_subtype = c("Classical" = "#3C6488B2", "Proneural" = "#91D1C2B2", "Mesenchymal" = "#DC0000b2")
+```
+
+
+```{r}
+library(lemon)
+library(cowplot)
+
+subtype_prop = colData(se) %>%
+  as.data.frame() %>%
+  #filter(IDH_mutation_status=="WT") %>%
+  drop_na(ECM.cluster) %>%
+  select(ECM.cluster, Subtype, Batch) %>%
+  group_by(ECM.cluster, Subtype) %>%
+  summarise(Count = n())
+
+p = ggplot(subtype_prop,
+       aes(fill=Subtype, y=ECM.cluster, x=Count)) + 
+    geom_bar(position="fill", stat="identity") +
+  xlab("Fraction") +
+  ylab(NULL) +
+  theme_cowplot() +
+  scale_fill_manual(values  = col_subtype)
+ggsave(p, path=fig_path, filename= "neftel_subtype.pdf", width=4.5, height=1.5, dpi = 700)
+```
+
+```{r}
+library(patchwork)
+# Basic piechart
+p1 = ggplot(subtype_prop %>% filter(ECM.cluster=="ECMhi"), aes(x="", y=Count, fill=Subtype)) +
+  geom_bar(stat="identity", width=1, color= "white") +
+  coord_polar("y", start=0) +
+  theme_void() +
+  scale_fill_manual(values  = col_subtype) + ggtitle("ECMhi")
+
+p2 = ggplot(subtype_prop %>% filter(ECM.cluster=="ECMlo"), aes(x="", y=Count, fill=Subtype)) +
+  geom_bar(stat="identity", width=1, color= "white") +
+  coord_polar("y", start=0) +
+  theme_void() +
+  scale_fill_manual(values  = col_subtype) + ggtitle("ECMlo")
+
+p1 + p2
+```
+```{r}
+ggsave(p1 + p2, path=fig_path, filename= "neftel_subtype_pie.pdf", width=4.5*1.2, height=1.5*1.2, dpi = 700)
+```
+
+
+
+```{r}
+subtype_d = colData(se) %>%
+  as.data.frame() %>%
+  rownames_to_column("Sample") %>%
+  select(Sample, Subtype, ECM.cluster) %>%
+  mutate(Dummy = 1) %>%
+  pivot_wider(names_from = Subtype, values_from = Dummy) %>%
+  mutate(Dummy = 1) %>%
+  pivot_wider(names_from = ECM.cluster, values_from = Dummy)
+
+subtype_d[is.na(subtype_d)] = 0
+
+fisher_result = data.frame()
+for (cl in c("ECMhi", "ECMlo")) {
+  for (sbtp in c("Mesenchymal", "Proneural", "Classical")) {
+    pval = fisher.test(subtype_d[[as.character(cl)]], subtype_d[[sbtp]])$p.val
+    or = fisher.test(subtype_d[[as.character(cl)]], subtype_d[[sbtp]])$estimate
+    fisher_result = rbind(
+      fisher_result,
+      data.frame(Cluster = as.character(cl), Subtype = sbtp, p.value = pval, OR = or)
+    )
+  }
+}
+rownames(fisher_result) = 1:nrow(fisher_result)
+fisher_result$p.adjust = p.adjust(fisher_result$p.value, method = "fdr")
+fisher_result$assoc = ifelse(fisher_result$OR>1 & fisher_result$p.adjust<0.05, 1, 0)
+```
+
+
+
+### Recurrence
+
+```{r}
+library(lemon)
+library(cowplot)
+
+group_prop = colData(se) %>%
+  as.data.frame() %>%
+  filter(Batch == "TCGA") %>%
+  drop_na(ECM.cluster) %>%
+  select(ECM.cluster, Group) %>%
+  drop_na(Group) %>%
+  group_by(Group, ECM.cluster) %>%
+  summarise(Count = n())
+
+p = ggplot(group_prop,
+       aes(fill=Group, y=ECM.cluster, x=Count)) + 
+    geom_bar(position="fill", stat="identity") +
+  xlab("Fraction") +
+  ylab(NULL) +
+  theme_cowplot() +
+  ggtitle("TCGA")
+
+ggsave(p, path=fig_path, filename= "group_distribution_TCGA.pdf", width=4.5, height=1.5, dpi = 700)
+```
+
+```{r}
+library(lemon)
+library(cowplot)
+
+group_prop = colData(se) %>%
+  as.data.frame() %>%
+  #filter(Batch == "TCGA") %>%
+  drop_na(ECM.cluster) %>%
+  select(ECM.cluster, Group) %>%
+  drop_na(Group) %>%
+  group_by(Group, ECM.cluster) %>%
+  summarise(Count = n())
+
+p = ggplot(group_prop,
+       aes(fill=Group, y=ECM.cluster, x=Count)) + 
+    geom_bar(position="fill", stat="identity") +
+  xlab("Fraction") +
+  ylab(NULL) +
+  theme_cowplot() +
+  ggtitle("All datasets")
+
+ggsave(p, path=fig_path, filename= "group_distribution.pdf", width=4.5, height=1.5, dpi = 700)
+```
+
+
+```{r}
+group_prop = colData(se) %>%
+  as.data.frame() %>%
+  filter(Batch == "CGGA693") %>%
+  drop_na(ECM.cluster) %>%
+  select(ECM.cluster, Group) %>%
+  drop_na(Group) %>%
+  group_by(ECM.cluster, Group) %>%
+  summarise(Count = n())
+
+p = ggplot(group_prop,
+       aes(fill=Group, y=ECM.cluster, x=Count)) + 
+    geom_bar(position="fill", stat="identity") +
+  xlab("Fraction") +
+  ylab(NULL) +
+  theme_cowplot() +
+  ggtitle("CGGA693")
+
+ggsave(p, path=fig_path, filename= "group_distribution_CGGA693.pdf", width=4.5, height=1.5, dpi = 700)
+```
+
+```{r}
+group_prop = colData(se) %>%
+  as.data.frame() %>%
+  filter(Batch == "CGGA325") %>%
+  drop_na(ECM.cluster) %>%
+  select(ECM.cluster, Group) %>%
+  drop_na(Group) %>%
+  group_by(ECM.cluster, Group) %>%
+  summarise(Count = n())
+
+p = ggplot(group_prop,
+       aes(fill=Group, y=ECM.cluster, x=Count)) + 
+    geom_bar(position="fill", stat="identity") +
+  xlab("Fraction") +
+  ylab(NULL) +
+  theme_cowplot() +
+  ggtitle("CGGA325")
+
+ggsave(p, path=fig_path, filename= "group_distribution_CGGA325.pdf", width=4.5, height=1.5, dpi = 700)
+```
+
+
+### Gender
+
+```{r}
+library(lemon)
+library(cowplot)
+
+group_prop = colData(se) %>%
+  as.data.frame() %>%
+  select(ECM.cluster, Gender) %>%
+  drop_na(Gender) %>%
+  group_by(Gender, ECM.cluster) %>%
+  summarise(Count = n())
+
+p = ggplot(group_prop,
+       aes(fill=Gender, y=ECM.cluster, x=Count)) + 
+    geom_bar(position="fill", stat="identity") +
+  xlab("Fraction") +
+  ylab(NULL) +
+  theme_cowplot() +
+  ggtitle("TCGA + CGGA")
+
+ggsave(p, path=fig_path, filename= "gender_distribution.pdf", width=4.5, height=1.5, dpi = 700)
+```
+
+
+
+## Survival
+
+Analyzing only core samples
+```{r}
+surv_data = colData(se) %>%
+  as.data.frame() %>%
+  drop_na(Deceased, ECM.cluster)
+surv_data = group_split(surv_data, Batch) %>% as.list()
+
+p1 = ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ ECM.cluster, data=surv_data[[1]] %>% filter(Core.sample==T)), pval=T, risk.table=F,
+  pval.coord = c(2500, .9), xlim = c(0, 4000), risk.table.col="strata", palette = unname(palette_ECM_subtype)) + ggtitle("CGGA325")
+
+p2 = ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ ECM.cluster, data=surv_data[[2]]  %>% filter(Core.sample==T)), pval=T, risk.table=F,
+  pval.coord = c(2500, .9), xlim = c(0, 4000), risk.table.col="strata", palette = unname(palette_ECM_subtype)) + ggtitle("CGGA693")
+
+p3 = ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ ECM.cluster, data=surv_data[[3]]  %>% filter(Core.sample==T)), pval=T, risk.table=F,
+  pval.coord = c(1500, .9), risk.table.col="strata", palette = unname(palette_ECM_subtype)) + ggtitle("TCGA")
+```
+
+```{r}
+pdf(paste0(fig_path, "surv_CGGA325.pdf"), width=3, height=3)
+print(p1, newpage = FALSE)
+dev.off()
+
+pdf(paste0(fig_path, "surv_CGGA693.pdf"), width=3, height=3)
+print(p2, newpage = FALSE)
+dev.off()
+
+pdf(paste0(fig_path, "surv_TCGA.pdf"), width=3, height=3)
+print(p3, newpage = FALSE)
+dev.off()
+```
+
+
+```{r}
+ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ ECM.cluster, data=surv_data[[1]] %>% filter(Group == "Recurrent")), pval=T, risk.table=T, risk.table.col="strata", palette = unname(palette_ECM_subtype)) + ggtitle("CGGA325")
+
+ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ ECM.cluster, data=surv_data[[2]] %>% filter(Group == "Recurrent")), pval=T, risk.table=T, risk.table.col="strata", palette = unname(palette_ECM_subtype)) + ggtitle("CGGA693")
+
+ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ ECM.cluster, data=surv_data[[3]] %>% filter(Group == "Recurrent")), pval=T, risk.table=T, risk.table.col="strata", palette = unname(palette_ECM_subtype)) + ggtitle("TCGA")
+```
+
+```{r}
+ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ ECM.cluster, data=surv_data[[1]] %>% filter(Chemo == 1)), pval=T, risk.table=T, risk.table.col="strata", palette = unname(palette_ECM_subtype)) + ggtitle("CGGA325")
+
+ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ ECM.cluster, data=surv_data[[2]] %>% filter(Chemo == 1)), pval=T, risk.table=T, risk.table.col="strata", palette = unname(palette_ECM_subtype)) + ggtitle("CGGA693")
+```
+
+```{r}
+ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ ECM.cluster, data=surv_data[[1]] %>% filter(Subtype == "Mesenchymal")), pval=T, risk.table=T, risk.table.col="strata", palette = unname(palette_ECM_subtype)) + ggtitle("CGGA325")
+
+ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ ECM.cluster, data=surv_data[[2]] %>% filter(Subtype == "Mesenchymal")), pval=T, risk.table=T, risk.table.col="strata", palette = unname(palette_ECM_subtype)) + ggtitle("CGGA693")
+```
+
+```{r}
+ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ ECM.cluster, data=surv_data[[1]] %>% filter(Subtype == "Proneural")), pval=T, risk.table=T, risk.table.col="strata", palette = unname(palette_ECM_subtype)) + ggtitle("CGGA325")
+
+ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ ECM.cluster, data=surv_data[[2]] %>% filter(Subtype == "Proneural")), pval=T, risk.table=T, risk.table.col="strata", palette = unname(palette_ECM_subtype)) + ggtitle("CGGA693")
+```
+
+```{r}
+ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ ECM.cluster, data=surv_data[[1]] %>% filter(Subtype == "Classical")), pval=T, risk.table=T, risk.table.col="strata", palette = unname(palette_ECM_subtype)) + ggtitle("CGGA325")
+
+ggsurvplot(
+  survfit(Surv(OS, Deceased) ~ ECM.cluster, data=surv_data[[2]] %>% filter(Subtype == "Classical")), pval=T, risk.table=T, risk.table.col="strata", palette = unname(palette_ECM_subtype)) + ggtitle("CGGA693")
+```
+
+
+
+### Functional profiling
+
+```{r, eval=F}
+source("util.R")
+```
+
+```{r, eval=F}
+p1 = clusterProfiler_GO_quick(rownames(filter(wilcox_result_merged, FDR<.001, Log2FC>(+0.1))),
+                         rownames(wilcox_result_merged),
+                         "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/GO",
+                         "ECMhi_test")
+
+p2 = clusterProfiler_GO_quick(rownames(filter(wilcox_result_merged, FDR<.001, Log2FC<(+0.1))),
+                         rownames(wilcox_result_merged),
+                         "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/GO",
+                         "ECMlo_test")
+```
+
+```{r}
+ggsave(p1 + scale_x_continuous(breaks=c(0, 0.1, .2)), path="/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/GO", filename= "ECMhi.pdf", width=5.5, height=4, dpi = 700)
+ggsave(p2 + scale_x_continuous(breaks=c(0, 0.1, .2)), path="/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/GO", filename= "ECMlo.pdf", width=5.5, height=4, dpi = 700)
+```
+
+
+
+```{r}
+sum(wilcox_result_merged$Log2FC<(-.1))
+```
+
+
+### Making a signature
+
+Finding a set of genes that best represent COLhi and COLlo clusters in all 3 datasets
+```{r}
+d1_sig = wilcox_result[[1]] %>% filter(Log2FC > 0) %>% head(160) %>% rownames()
+d2_sig = wilcox_result[[2]] %>% filter(Log2FC > 0) %>% head(160) %>% rownames()
+d3_sig = wilcox_result[[3]] %>% filter(Log2FC > 0) %>% head(160) %>% rownames()
+
+ecmhi_sig = intersect(
+  intersect(d1_sig, d2_sig),
+  d3_sig
+)
+
+d1_sig = wilcox_result[[1]] %>% filter(Log2FC < 0) %>% head(190) %>% rownames()
+d2_sig = wilcox_result[[2]] %>% filter(Log2FC < 0) %>% head(190) %>% rownames()
+d3_sig = wilcox_result[[3]] %>% filter(Log2FC < 0) %>% head(190) %>% rownames()
+
+ecmlo_sig = intersect(
+  intersect(d1_sig, d2_sig),
+  d3_sig
+)
+
+ecmhi_sig
+ecmlo_sig
+```
+
+```{r}
+ecm_sig = list("ECMhi" = ecmhi_sig, "ECMlo" = ecmlo_sig)
+saveRDS(ecm_sig, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+```
+
+```{r}
+ecm_sig = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+ecm_sig = unname(unlist(ecm_sig))
+```
+
+
+
+```{r}
+names(wilcox_result) = c("CGGA325", "CGGA693", "TCGA")
+wilcox_result
+```
+
+```{r}
+wilcox_result_de = lapply(wilcox_result, function(x) {
+  filter(x, FDR < 0.05) %>% filter(Log2FC < -1 | Log2FC > 1)
+})
+
+overlap_list = lapply(wilcox_result, function(x) {
+  intersect(rownames(x), ecm_sig)
+})
+```
+
+```{r}
+library(ggVennDiagram)
+library(RColorBrewer)
+
+p = ggVennDiagram(overlap_list) + scale_fill_gradient(low = "#F4FAFE", high = "#4981BF")
+```
+
+```{r}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG1"
+ggsave(p, path=fig_path, filename= "ECM_sig_gene_overlap_with_DE_genes.pdf", width=4.5, height=4.5, dpi = 700)
+```
+
+
+
+
+### GSEA
+
+
+
+```{r}
+library(clusterProfiler)
+library(ReactomePA)
+```
+
+```{r}
+x = wilcox_result_merged %>% rownames_to_column("gene")
+
+ids = bitr(x$gene, 
+            fromType = "SYMBOL", 
+            toType = c("ENTREZID"), 
+            OrgDb = "org.Hs.eg.db")
+
+keep = which(duplicated(ids$ENTREZID) == FALSE)
+ids = ids[keep,]
+ids = ids %>%
+  left_join(
+    x, c("SYMBOL"="gene")
+  )
+foldchanges = ids$Log2FC
+names(foldchanges) = ids$ENTREZID
+foldchanges = sort(foldchanges, decreasing = TRUE)
+
+gsePathway_result = gsePathway(geneList = foldchanges,
+              pvalueCutoff = .5,
+              verbose = T)
+
+saveRDS(gseGO_CGGA325, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/gsea/wilcox_result_merged_reactome.rds")
+gsePathway_result_table = gsePathway_result@result
+
+View(gsePathway_result_table)
+```
+
+```{r}
+library(clusterProfiler)
+```
+
+```{r}
+res = wilcox_result_merged
+
+ids = bitr(rownames(res), 
+            fromType = "SYMBOL", 
+            toType = c("ENTREZID"), 
+            OrgDb = "org.Hs.eg.db")
+keep = which(duplicated(ids$ENTREZID) == FALSE)
+ids = ids[keep,]
+ids = ids %>%
+  left_join(
+    res %>% rownames_to_column("SYMBOL"), "SYMBOL"
+  )
+foldchanges = ids$Log2FC
+names(foldchanges) = ids$ENTREZID
+foldchanges = sort(foldchanges, decreasing = TRUE)
+gseGO_CGGA325 = gseGO(geneList = foldchanges,
+              OrgDb = "org.Hs.eg.db",
+              minGSSize = 120,
+              pvalueCutoff = .5,
+              verbose = FALSE)
+saveRDS(gseGO_CGGA325, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/gsea/CGGA325.rds")
+gseGO_CGGA325_result = gseGO_CGGA325@result
+```
+
+
+```{r}
+gseaplot(gseGO_CGGA325, geneSetID = 'GO:0050804', by = "runningScore")
+gseaplot(gseGO_CGGA325, geneSetID = 'GO:0002697', by = "runningScore")
+gseaplot(gseGO_CGGA325, geneSetID = 'GO:0001525', by = "runningScore")
+```
+
+
+```{r}
+res = wilcox_result[[1]]
+
+ids = bitr(rownames(res), 
+            fromType = "SYMBOL", 
+            toType = c("ENTREZID"), 
+            OrgDb = "org.Hs.eg.db")
+keep = which(duplicated(ids$ENTREZID) == FALSE)
+ids = ids[keep,]
+ids = ids %>%
+  left_join(
+    res %>% rownames_to_column("SYMBOL"), "SYMBOL"
+  )
+foldchanges = ids$Log2FC
+names(foldchanges) = ids$ENTREZID
+foldchanges = sort(foldchanges, decreasing = TRUE)
+gseGO_TCGA = gseGO(geneList = foldchanges,
+              OrgDb = "org.Hs.eg.db",
+              minGSSize = 120,
+              pvalueCutoff = .5,
+              verbose = FALSE)
+saveRDS(gseGO_TCGA, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/gsea/TCGA.rds")
+gseGO_TCGA_result = gseGO_TCGA@result
+```
+
+```{r}
+res = wilcox_result[[3]]
+
+ids = bitr(rownames(res), 
+            fromType = "SYMBOL", 
+            toType = c("ENTREZID"), 
+            OrgDb = "org.Hs.eg.db")
+keep = which(duplicated(ids$ENTREZID) == FALSE)
+ids = ids[keep,]
+ids = ids %>%
+  left_join(
+    res %>% rownames_to_column("SYMBOL"), "SYMBOL"
+  )
+foldchanges = ids$Log2FC
+names(foldchanges) = ids$ENTREZID
+foldchanges = sort(foldchanges, decreasing = TRUE)
+gseGO_CGGA693 = gseGO(geneList = foldchanges,
+              OrgDb = "org.Hs.eg.db",
+              minGSSize = 120,
+              pvalueCutoff = .5,
+              verbose = FALSE)
+saveRDS(gseGO_CGGA693, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/gsea/CGGA693.rds")
+gseGO_CGGA693_result = gseGO_CGGA693@result
+```
+```{r}
+s1 = gseGO_TCGA_result %>% filter(p.adjust<0.01, NES>0) %>% head(50) %>% rownames()
+s2 = gseGO_CGGA325_result %>% filter(p.adjust<0.01, NES>0) %>% head(50) %>% rownames()
+s3 = gseGO_CGGA693_result %>% filter(p.adjust<0.01, NES>0) %>% head(50) %>% rownames()
+
+intersect(intersect(s1, s2), s3)
+gseGO_TCGA_result[intersect(intersect(s1, s2), s3),]
+```
+
+```{r}
+gseaplot(gseGO_TCGA, geneSetID = 'GO:0002250')
+gseaplot(gseGO_CGGA325, geneSetID = 'GO:0002250')
+gseaplot(gseGO_CGGA693, geneSetID = 'GO:0002250')
+```
+
+```{r}
+saveRDS(list(
+  "COL1hi" = col_hi_sig,
+  "COL1lo" = col_lo_sig
+), file = "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/bulk_COL_sigs.rds")
+```
+
+
+
+## Tumor purity
+
+```{r}
+estimate_scores = read.table("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/GBM_TCGA_paper_ESTIMATE.combined.score.tsv")
+se = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA-CGGA-ALL-GRADES-SummarizedExperiment.rds")
+```
+
+```{r}
+coldata_se = colData(se) %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  left_join(
+    estimate_scores %>% rownames_to_column(),
+    "rowname"
+  )
+```
+
+```{r}
+library(corrplot)
+library(psych)
+
+coldata_se = coldata_se %>% select(ECMhi.score, ECMlo.score, paper_ESTIMATE.combined.score, paper_ESTIMATE.immune.score, paper_ESTIMATE.stromal.score)
+colnames(coldata_se) = c("ECMhi score", "ECMlo score", "Combined score", "Immune score", "Stromal score")
+
+corr.mtx = corr.test(coldata_se, method="spearman")
+corr.mtx$r[corr.mtx$p>0.05] <- 0
+```
+
+```{r}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG1/"
+pdf(paste0(fig_path, "tumor_purity_corr_GBM.pdf"), width = 4.5, height = 3.5)
+corrplot(corr.mtx$r,is.corr=T,  tl.col = "black")
+dev.off()
+```
+
+
+### Scatter plots
+
+```{r}
+coldata_se = colData(se) %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  left_join(
+    estimate_scores %>% rownames_to_column(),
+    "rowname"
+  )
+
+coldata_se %>%
+  select(rowname, ECMhi.score, ECMlo.score, paper_ESTIMATE.combined.score, paper_ESTIMATE.immune.score, paper_ESTIMATE.stromal.score) %>%
+  pivot_longer(!rowname) %>%
+  ggscatter(x)
+```
+
+
+
+
+
+
+### Corrplot
+
+```{r}
+library(corrplot)
+library(psych)
+
+x = as.data.frame(colData(se))[,c("ECMhi.score", "ECMlo.score", "MFB_score", "PFB_score", "PC_score", "SMC_score")]
+colnames(x) = c("ECMhi", "ECMlo", "M-FB", "P-FB", "PC", "SMC")
+x = x[,c( "P-FB", "SMC", "ECMhi", "PC", "M-FB",  "ECMlo")]
+
+corr.mtx = corr.test(x, method="spearman")
+corr.mtx$r[corr.mtx$p>0.05] <- 0
+```
+
+```{r}
+Heatmap(corr.mtx$r)
+```
+
+
+```{r}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2/"
+pdf(paste0(fig_path, "metagene_correlation.pdf"), width = 4, height = 3)
+corrplot(corr.mtx$r,is.corr=T,  tl.col = "black")
+dev.off()
+```
+
+
+
+
+
+
+
+
+
+## Subtype calling for all tumors
+
+### ECM subtypes
+
+```{r}
+sigs = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+ECMhi_sig = sigs$ECMhi
+ECMlo_sig = sigs$ECMlo
+sig_genes_d = rbind(data.frame(Gene = ECMhi_sig, Signature = "ECMhi"), data.frame(Gene = ECMlo_sig, Signature = "ECMlo"))
+```
+
+
+```{r}
+readr::write_tsv(sig_genes_d, "/Volumes/TOSHIBA/TIMElab/figures/supplementary_data/signature_genes.tsv")
+```
+
+```{r}
+se = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA-CGGA-ALL-GRADES-SummarizedExperiment.rds")
+```
+
+
+```{r}
+library(scrabble)
+library(ComplexHeatmap)
+
+sigs$ECMhi = sigs$ECMhi[sigs$ECMhi%in%rownames(se)]
+sigs$ECMlo = sigs$ECMlo[sigs$ECMlo%in%rownames(se)]
+
+sig_scores = scrabble::score(
+  mat = assay(se, 2),
+  groups = sigs
+)
+
+saveRDS(sig_scores, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECMhilo_scores_TCGA-CGGA-ALL-GRADES.rds")
+```
+
+
+```{r}
+sig_scores = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECMhilo_scores_TCGA-CGGA-ALL-GRADES.rds")
+```
+
+
+```{r}
+se$ECMhi.score = sig_scores[,"ECMhi"]
+se$ECMlo.score = sig_scores[,"ECMlo"]
+
+se$ECM.cluster = sig_scores %>%
+  as.data.frame() %>%
+  mutate(ECM.cluster = if_else(ECMhi > 0 & ECMlo < -(0), "ECMhi",
+                               if_else(ECMhi < (-0) & ECMlo > 0, "ECMlo", "mixed"))) %>%
+  pull(ECM.cluster)
+
+hcl_obj = hclust(dist(sig_scores))
+cluster_calls = cutree(hcl_obj, k=2)
+
+Heatmap(t(sig_scores),
+        cluster_columns = hcl_obj, show_column_names = F)
+```
+
+```{r}
+ha = HeatmapAnnotation(
+  "Grade" = factor(se$Grade),
+  "IDH status" = factor(se$IDH_mutation_status),
+  "Gender" = factor(se$Gender),
+  "Dataset" = factor(se$Batch),
+  #"Histology" = factor(se$Histology),
+  col = list("Grade" = c("WHO II" = "#559392", "WHO III" = "#466270", "WHO IV" = "#322C3A"),
+             "IDH status" = c("Mutant" = "#3C5488FF", "Wildtype" = "white"),
+             "Gender" = c("Female" = "#F39B7FFF", "Male" = "#8491B4FF"),
+             "Histology" = c("Glioblastoma" = "#119B95",
+                              "Astrocytoma" = "#43CCC4",
+                              "Oligodendroglioma" = "#E0F0D8",
+                              "Anaplastic astrocytoma" = "#FD0D52",
+                              "Anaplastic oligodendroglioma" = "#E63F6E",
+                              "Oligoastrocytoma" = "#D00B48",
+                              "Anaplastic oligoastrocytoma" = "#E27A5F"),
+             "Dataset" = c("CGGA325" = "#E64B35FF", "CGGA693" = "#4DBBD5FF", "TCGA_GBM" = "#00A087FF", "TCGA_LGG" = "#3C5488FF")),
+  show_legend = T,
+  show_annotation_name = T,
+  simple_anno_size = unit(.3, "cm")
+)
+
+hcl = hclust(dist(sig_scores, method = "maximum"), method = "average")
+
+
+ht1 = Heatmap(t(sig_scores),
+        name = "Signature score",
+        top_annotation = ha,
+        #column_split = factor(samples$structure, levels = c("LE", "IT", "CT", "CThbv", "CTmvp", "CTpan", "CTpnz")),
+        show_column_dend = F,
+        #column_split = factor(se$ECM.cluster),
+        show_row_dend = F,
+        cluster_columns = hcl,
+        column_title_rot = 90,
+        show_column_names = F,
+        col = colorRamp2(seq(-3, 3, length.out=11), colorRampPalette(c("#4DBBD5FF", "#E64B35FF"))(11)),
+        width = unit(11, "cm"), 
+        height = unit(.75, "cm"))
+
+ht1
+```
+
+```{r}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG1/"
+pdf(paste0(fig_path, "signature_genes_heatmap_all_tumors.pdf"), width = 10, height = 5)
+draw(ht1, legend_grouping = "original")
+dev.off()
+```
+
+```{r}
+mat_scaled = assay(se, 2)[rownames(se)%in%c(sigs$ECMhi, sigs$ECMlo),]
+mat_scaled = t(scale(t(mat_scaled)))
+
+#ha = HeatmapAnnotation(
+#  "Region" = factor(samples$structure, levels = c("LE", "IT", "CT", "CThbv", "CTmvp", "CTpan", "CTpnz")),
+#  col = list(
+#    "Region" = col_ivygap),
+##  show_legend = T,
+#  show_annotation_name = F,
+#  simple_anno_size = unit(.3, "cm")
+#)
+
+row_split_vec = c()
+row_split_vec[rownames(mat_scaled)%in%sigs$ECMhi] = "ECMhi"
+row_split_vec[rownames(mat_scaled)%in%sigs$ECMlo] = "ECMlo"
+
+genes_to_label = c("LAMB1", "COL5A2", "LAMC1", "ITGA5", "MMP14", "COL1A1", "TGFBI", "FN1", "NFKB1", "BRSK2", "CNTN1", "CDK5R1", "PLXNB1", "COL3A1", "ADAM12", "POSTN", "RUNX1")
+genes_to_label = rownames(mat_scaled)[rownames(mat_scaled)%in%genes_to_label]
+
+ht = Heatmap(
+  mat_scaled,
+  name = "Scaled expr",
+  col = colorRamp2(seq(-2.5, 2.5, length.out=11), rev(brewer.pal(n=11, name="RdBu"))),
+  row_split = factor(row_split_vec),
+  show_row_names = F,
+  show_row_dend = F,
+  column_title_rot = 90,
+  row_names_gp = gpar(fontsize = 3),
+  show_column_names = F,
+  #top_annotation = ha,
+  show_column_dend = F,
+  cluster_columns = hcl,
+  width = unit(11, "cm"),
+  height = unit(8, "cm"),
+  cluster_column_slices = TRUE,
+  #column_split = factor(samples$structure, levels = c("LE", "IT", "CT", "CThbv", "CTmvp", "CTpan", "CTpnz"))
+) +
+  rowAnnotation(link = anno_mark(at = which(rownames(mat_scaled) %in% genes_to_label), 
+                                 labels = genes_to_label, 
+                                 labels_gp = gpar(fontsize = 8), padding = unit(1.7, "mm")))
+
+ht
+```
+
+```{r}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG1/"
+pdf(paste0(fig_path, "signature_genes_heatmap_all_tumors_2.pdf"), width = 10, height = 5)
+draw(ht, legend_grouping = "original")
+dev.off()
+```
+
+
+
+#### Dependence of scores on dataset
+
+```{r}
+library(cowplot)
+library(rstatix)
+library(patchwork)
+
+score_data_df = colData(se) %>%
+  as.data.frame() %>%
+  select(Batch, ECMhi.score, ECMlo.score)
+
+
+stat.test <- score_data_df %>%
+  t_test(ECMhi.score ~ Batch) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "Batch") %>%
+  mutate(y.position = y.position+.5)
+
+p1 = ggboxplot(score_data_df, x = "Batch", y = "ECMhi.score") +
+  theme_cowplot() +
+  labs(x = NULL, y = "ECMhi score") +
+  stat_pvalue_manual(stat.test, label = "p.adj.signif") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+
+stat.test <- score_data_df %>%
+  t_test(ECMlo.score ~ Batch) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "Batch") %>%
+  mutate(y.position = y.position+.5)
+
+p2 = ggboxplot(score_data_df, x = "Batch", y = "ECMlo.score") +
+  theme_cowplot() +
+  labs(x = NULL, y = "ECMlo score") +
+  stat_pvalue_manual(stat.test, label = "p.adj.signif") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+p = p1 + p2
+p
+```
+
+```{r}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG1"
+ggsave(p, path=fig_path, filename= "ECM_sigscore_across_datasets.pdf", width=5.5, height=4, dpi = 700)
+```
+
+
+
+#### Enrichment test
+
+```{r}
+se_sub = se[,!is.na(se$Grade)&se$ECM.cluster!="mixed"]
+```
+
+Grade
+```{r}
+chisq.test(se_sub$Grade, se_sub$ECM.cluster, correct=FALSE)
+```
+
+IDH status
+```{r}
+chisq.test(se_sub$IDH_mutation_status, se_sub$ECM.cluster, correct=FALSE)
+```
+
+Gender
+```{r}
+chisq.test(se_sub$Gender, se_sub$ECM.cluster, correct=FALSE)
+```
+Mol subtype of gbm
+
+```{r}
+gbm = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA-CGGA-SummarizedExperiment.rds")
+chisq.test(gbm$Subtype, gbm$ECM.cluster, correct=FALSE)
+```
+
+
+
+### CAFs
+
+```{r}
+se = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA-CGGA-ALL-GRADES-SummarizedExperiment.rds")
+```
+
+
+```{r}
+mfb_markers = read.table("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/muralcell/markers_M-FB_vs_ALL.tsv", sep="\t") %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(avg_log2FC)) %>%
+  filter(p_val_adj<0.05, gene %in% rownames(se)) %>%
+  head(50) %>%
+  pull("gene")
+
+pfb_markers = read.table("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/muralcell/markers_P-FB_vs_ALL.tsv", sep="\t") %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(avg_log2FC)) %>%
+  filter(p_val_adj<0.05, gene %in% rownames(se)) %>%
+  head(50) %>%
+  pull("gene")
+
+pc_markers = read.table("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/muralcell/markers_PC_vs_ALL.tsv", sep="\t") %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(avg_log2FC)) %>%
+  filter(p_val_adj<0.05, gene %in% rownames(se)) %>%
+  head(50) %>%
+  pull("gene")
+
+smc_markers = read.table("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/muralcell/markers_SMC_vs_ALL.tsv", sep="\t") %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(avg_log2FC)) %>%
+  filter(p_val_adj<0.05, gene %in% rownames(se)) %>%
+  head(50) %>%
+  pull("gene")
+```
+
+
+Scoring
+```{r}
+sig_scores = scrabble::score(
+  mat = assay(se, 2),
+  groups = list("M-FB" = mfb_markers,
+                "P-FB" = pfb_markers,
+                "PC" = pc_markers,
+                "SMC" = smc_markers)
+)
+
+se$MFB_score <- sig_scores[,"M-FB"]
+se$PFB_score <- sig_scores[,"P-FB"]
+se$PC_score <- sig_scores[,"PC"]
+se$SMC_score <- sig_scores[,"SMC"]
+```
+
+
+```{r}
+plot_data = colData(se) %>% as.data.frame()
+
+p1 = ggscatter(plot_data, x = "ECMhi.score", y = "MFB_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman",  label.sep = "\n")
+   ) + labs(x = "ECMhi score", y = "M-FB score")
+
+p2 = ggscatter(plot_data, x = "ECMlo.score", y = "MFB_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman",   label.sep = "\n")
+   ) + labs(x = "ECMlo score", y = "M-FB score")
+
+p = p1 + p2
+p
+```
+
+```{r, eval=F}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2"
+ggsave(p, path=fig_path, filename= "MFB-ECM_score.pdf", width=5.5, height=3, dpi = 700)
+```
+
+
+
+```{r}
+plot_data = colData(se) %>% as.data.frame()
+
+p1 = ggscatter(plot_data, x = "ECMhi.score", y = "PFB_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman",  label.sep = "\n")
+   ) + labs(x = "ECMhi score", y = "P-FB score")
+
+p2 = ggscatter(plot_data, x = "ECMlo.score", y = "PFB_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = -1,   label.sep = "\n")
+   ) + labs(x = "ECMlo score", y = "P-FB score")
+
+p = p1 + p2
+p
+```
+
+```{r, eval=F}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2"
+ggsave(p, path=fig_path, filename= "PFB-ECM_score.pdf", width=5.5, height=3, dpi = 700)
+```
+
+
+
+```{r}
+plot_data = colData(se) %>% as.data.frame()
+
+p1 = ggscatter(plot_data, x = "ECMhi.score", y = "PC_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman",  label.sep = "\n")
+   ) + labs(x = "ECMhi score", y = "P-FB score")
+
+p2 = ggscatter(plot_data, x = "ECMlo.score", y = "PC_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = -1,   label.sep = "\n")
+   ) + labs(x = "ECMlo score", y = "P-FB score")
+
+p = p1 + p2
+p
+```
+
+```{r, eval=F}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2"
+ggsave(p, path=fig_path, filename= "PC-ECM_score.pdf", width=5.5, height=3, dpi = 700)
+```
+
+
+
+```{r}
+plot_data = colData(se) %>% as.data.frame()
+
+p1 = ggscatter(plot_data, x = "ECMhi.score", y = "SMC_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman",  label.sep = "\n")
+   ) + labs(x = "ECMhi score", y = "P-FB score")
+
+p2 = ggscatter(plot_data, x = "ECMlo.score", y = "SMC_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = -1,   label.sep = "\n")
+   ) + labs(x = "ECMlo score", y = "P-FB score")
+
+p = p1 + p2
+p
+```
+
+```{r, eval=F}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2"
+ggsave(p, path=fig_path, filename= "SMC-ECM_score.pdf", width=5.5, height=3, dpi = 700)
+```
+
+
+
+
+
+
+
+#### Removing duplicates
+
+```{r}
+mfb_markers = read.table("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/muralcell/markers_M-FB_vs_ALL.tsv", sep="\t") %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(avg_log2FC)) %>%
+  filter(p_val_adj<0.05) %>%
+  pull("gene")
+
+pfb_markers = read.table("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/muralcell/markers_P-FB_vs_ALL.tsv", sep="\t") %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(avg_log2FC)) %>%
+  filter(p_val_adj<0.05) %>%
+  pull("gene")
+
+pc_markers = read.table("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/muralcell/markers_PC_vs_ALL.tsv", sep="\t") %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(avg_log2FC)) %>%
+  filter(p_val_adj<0.05) %>%
+  pull("gene")
+
+smc_markers = read.table("/Volumes/TOSHIBA/TIMElab/GSE182109_processed/muralcell/markers_SMC_vs_ALL.tsv", sep="\t") %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(avg_log2FC)) %>%
+  filter(p_val_adj<0.05) %>%
+  pull("gene")
+```
+
+```{r}
+marker_genes = c(mfb_markers, pfb_markers, pc_markers, smc_markers)
+dups = marker_genes[duplicated(marker_genes)]
+
+
+sinature_list = list("M-FB" = mfb_markers,
+     "P-FB" = pfb_markers,
+     "PC" = pc_markers,
+     "SMC" = smc_markers)
+
+sinature_list_unique = lapply(sinature_list, function(x) {x[!x%in%dups]})
+```
+
+
+```{r}
+save(sinature_list_unique, sinature_list, file = "/Volumes/TOSHIBA/TIMElab/GSE182109_processed/muralcell/mural_subcluster_signatures.RData")
+```
+
+
+Scoring
+```{r}
+sig_scores = scrabble::score(
+  mat = assay(se, 2),
+  groups = sinature_list_unique
+)
+
+se$MFB_score <- sig_scores[,"M-FB"]
+se$PFB_score <- sig_scores[,"P-FB"]
+se$PC_score <- sig_scores[,"PC"]
+se$SMC_score <- sig_scores[,"SMC"]
+```
+
+
+```{r}
+plot_data = colData(se) %>% as.data.frame()
+
+p1 = ggscatter(plot_data, x = "ECMhi.score", y = "MFB_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman",  label.sep = "\n")
+   ) + labs(x = "ECMhi score", y = "M-FB score")
+
+p2 = ggscatter(plot_data, x = "ECMlo.score", y = "MFB_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman",   label.sep = "\n")
+   ) + labs(x = "ECMlo score", y = "M-FB score")
+
+p = p1 + p2
+p
+```
+
+```{r, eval=F}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2"
+ggsave(p, path=fig_path, filename= "MFB_unique-ECM_score.pdf", width=5.5, height=3, dpi = 700)
+```
+
+
+
+```{r}
+plot_data = colData(se) %>% as.data.frame()
+
+p1 = ggscatter(plot_data, x = "ECMhi.score", y = "PFB_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman",  label.sep = "\n")
+   ) + labs(x = "ECMhi score", y = "P-FB score")
+
+p2 = ggscatter(plot_data, x = "ECMlo.score", y = "PFB_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = -1,   label.sep = "\n")
+   ) + labs(x = "ECMlo score", y = "P-FB score")
+
+p = p1 + p2
+p
+```
+
+```{r, eval=F}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2"
+ggsave(p, path=fig_path, filename= "PFB_unique-ECM_score.pdf", width=5.5, height=3, dpi = 700)
+```
+
+
+
+```{r}
+plot_data = colData(se) %>% as.data.frame()
+
+p1 = ggscatter(plot_data, x = "ECMhi.score", y = "PC_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman",  label.sep = "\n")
+   ) + labs(x = "ECMhi score", y = "P-FB score")
+
+p2 = ggscatter(plot_data, x = "ECMlo.score", y = "PC_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = -1,   label.sep = "\n")
+   ) + labs(x = "ECMlo score", y = "P-FB score")
+
+p = p1 + p2
+p
+```
+
+```{r, eval=F}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2"
+ggsave(p, path=fig_path, filename= "PC_unique-ECM_score.pdf", width=5.5, height=3, dpi = 700)
+```
+
+
+
+```{r}
+plot_data = colData(se) %>% as.data.frame()
+
+p1 = ggscatter(plot_data, x = "ECMhi.score", y = "SMC_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman",  label.sep = "\n")
+   ) + labs(x = "ECMhi score", y = "P-FB score")
+
+p2 = ggscatter(plot_data, x = "ECMlo.score", y = "SMC_score",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = -1,   label.sep = "\n")
+   ) + labs(x = "ECMlo score", y = "P-FB score")
+
+p = p1 + p2
+p
+```
+
+```{r, eval=F}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2"
+ggsave(p, path=fig_path, filename= "SMC_unique-ECM_score.pdf", width=5.5, height=3, dpi = 700)
+```
+
+
+
+#### Corrplot
+
+```{r}
+library(corrplot)
+library(psych)
+
+x = as.data.frame(colData(se))[,c("ECMhi.score", "ECMlo.score", "MFB_score", "PFB_score", "PC_score", "SMC_score")]
+colnames(x) = c("ECMhi", "ECMlo", "M-FB", "P-FB", "PC", "SMC")
+x = x[,c( "P-FB", "SMC", "ECMhi", "PC", "M-FB",  "ECMlo")]
+
+corr.mtx = corr.test(x, method="spearman")
+corr.mtx$r[corr.mtx$p>0.05] <- 0
+```
+
+```{r}
+Heatmap(corr.mtx$r)
+```
+
+
+```{r}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2/"
+pdf(paste0(fig_path, "metagene_correlation.pdf"), width = 4, height = 3)
+corrplot(corr.mtx$r,is.corr=T,  tl.col = "black")
+dev.off()
+```
+
+
+
+#### Survival
+
+```{r}
+se$MFB.enrich <- NA
+se$MFB.enrich[se$MFB_score < quantile(se$MFB_score)[2]] <- "low"
+se$MFB.enrich[se$MFB_score > quantile(se$MFB_score)[4]] <- "high"
+
+se$PFB.enrich <- NA
+se$PFB.enrich[se$PFB_score < quantile(se$PFB_score)[2]] <- "low"
+se$PFB.enrich[se$PFB_score > quantile(se$PFB_score)[4]] <- "high"
+
+se$PC.enrich <- NA
+se$PC.enrich[se$PC_score < quantile(se$PC_score)[2]] <- "low"
+se$PC.enrich[se$PC_score > quantile(se$PC_score)[4]] <- "high"
+
+se$SMC.enrich <- NA
+se$SMC.enrich[se$SMC_score < quantile(se$SMC_score)[2]] <- "low"
+se$SMC.enrich[se$SMC_score > quantile(se$SMC_score)[4]] <- "high"
+```
+
+```{r}
+surv_data = colData(se) %>%
+  as.data.frame() %>%
+  drop_na(Deceased, MFB.enrich)
+
+surv_data$Histology = factor(surv_data$Histology)
+surv_data$Batch = factor(surv_data$Batch)
+surv_data_list = group_split(surv_data, Batch) %>% as.list()
+names(surv_data_list) = levels(surv_data$Batch)
+
+batches_vec = names(surv_data_list)
+histologies_vec = levels(surv_data$Histology)
+
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2/survival/M-FB/"
+
+for (i in batches_vec) {
+    for (j in histologies_vec) {
+      surv_data_sub = surv_data_list[[i]] %>% filter(Histology == j)
+      if (length(unique(surv_data_sub$MFB.enrich))>1) {
+        p1 = ggsurvplot(survfit(Surv(OS, Deceased) ~ MFB.enrich,
+                            data=surv_data_sub
+                            ), pval=T, legend = "none", risk.table=F, risk.table.col="strata", palette = unname(palette_ECM_subtype), ylab = "OS", xlab = "Time (days)") + ggtitle(j)
+    
+        pdf(paste0(fig_path, paste(j, i, "OS.pdf", sep="_")), width=4, height=3)
+        print(p1, newpage = FALSE)
+        dev.off()
+      }
+  }
+}
+
+
+surv_data = colData(se) %>%
+  as.data.frame() %>%
+  drop_na(Deceased, PFB.enrich)
+
+surv_data$Histology = factor(surv_data$Histology)
+surv_data$Batch = factor(surv_data$Batch)
+surv_data_list = group_split(surv_data, Batch) %>% as.list()
+names(surv_data_list) = levels(surv_data$Batch)
+
+batches_vec = names(surv_data_list)
+histologies_vec = levels(surv_data$Histology)
+
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2/survival/P-FB/"
+
+for (i in batches_vec) {
+    for (j in histologies_vec) {
+      surv_data_sub = surv_data_list[[i]] %>% filter(Histology == j)
+      if (length(unique(surv_data_sub$PFB.enrich))>1) {
+        p1 = ggsurvplot(survfit(Surv(OS, Deceased) ~ PFB.enrich,
+                            data=surv_data_sub
+                            ), pval=T, legend = "none", risk.table=F, risk.table.col="strata", palette = unname(palette_ECM_subtype), ylab = "OS", xlab = "Time (days)") + ggtitle(j)
+    
+        pdf(paste0(fig_path, paste(j, i, "OS.pdf", sep="_")), width=4, height=3)
+        print(p1, newpage = FALSE)
+        dev.off()
+      }
+  }
+}
+
+surv_data = colData(se) %>%
+  as.data.frame() %>%
+  drop_na(Deceased, SMC.enrich)
+
+surv_data$Histology = factor(surv_data$Histology)
+surv_data$Batch = factor(surv_data$Batch)
+surv_data_list = group_split(surv_data, Batch) %>% as.list()
+names(surv_data_list) = levels(surv_data$Batch)
+
+batches_vec = names(surv_data_list)
+histologies_vec = levels(surv_data$Histology)
+
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2/survival/SMC/"
+
+for (i in batches_vec) {
+    for (j in histologies_vec) {
+      surv_data_sub = surv_data_list[[i]] %>% filter(Histology == j)
+      if (length(unique(surv_data_sub$SMC.enrich))>1) {
+        p1 = ggsurvplot(survfit(Surv(OS, Deceased) ~ SMC.enrich,
+                            data=surv_data_sub
+                            ), pval=T, legend = "none", risk.table=F, risk.table.col="strata", palette = unname(palette_ECM_subtype), ylab = "OS", xlab = "Time (days)") + ggtitle(j)
+    
+        pdf(paste0(fig_path, paste(j, i, "OS.pdf", sep="_")), width=4, height=3)
+        print(p1, newpage = FALSE)
+        dev.off()
+      }
+  }
+}
+
+surv_data = colData(se) %>%
+  as.data.frame() %>%
+  drop_na(Deceased, PC.enrich)
+
+surv_data$Histology = factor(surv_data$Histology)
+surv_data$Batch = factor(surv_data$Batch)
+surv_data_list = group_split(surv_data, Batch) %>% as.list()
+names(surv_data_list) = levels(surv_data$Batch)
+
+batches_vec = names(surv_data_list)
+histologies_vec = levels(surv_data$Histology)
+
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG2/survival/PC/"
+
+for (i in batches_vec) {
+    for (j in histologies_vec) {
+      surv_data_sub = surv_data_list[[i]] %>% filter(Histology == j)
+      if (length(unique(surv_data_sub$PC.enrich))>1) {
+        p1 = ggsurvplot(survfit(Surv(OS, Deceased) ~ PC.enrich,
+                            data=surv_data_sub
+                            ), pval=T, legend = "none", risk.table=F, risk.table.col="strata", palette = unname(palette_ECM_subtype), ylab = "OS", xlab = "Time (days)") + ggtitle(j)
+    
+        pdf(paste0(fig_path, paste(j, i, "OS.pdf", sep="_")), width=4, height=3)
+        print(p1, newpage = FALSE)
+        dev.off()
+      }
+  }
+}
+```
+
+
+
+```{r}
+se$CAF_score_assignment <- NA
+se$CAF_score_assignment[sig_scores <= 1] <- "low"
+se$CAF_score_assignment[sig_scores > 1] <- "high"
+```
+
+
+
+
+## Table with ECM signature genes
+
+### ECM subtypes
+
+```{r}
+sigs = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+ECMhi_sig = sigs$ECMhi
+ECMlo_sig = sigs$ECMlo
+sig_genes_d = rbind(data.frame(Gene = ECMhi_sig, Signature = "ECMhi"), data.frame(Gene = ECMlo_sig, Signature = "ECMlo"))
+```
+
+```{r}
+wilcox_result = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM.sign.wilcox.rds")
+dataset_names = c("CGGA325", "CGGA693", "TCGA")
+names(wilcox_result) = dataset_names
+```
+
+```{r}
+library(tidyverse)
+
+wilcox_result_sub = lapply(wilcox_result, function(x) {
+  x[sig_genes_d$Gene, c("p.value", "FDR", "Log2FC")]
+})
+
+for (i in 1:3) {
+  colnames(wilcox_result_sub[[i]]) = paste0(rep(dataset_names[i], 3), ":", colnames(wilcox_result_sub[[i]]))
+}
+
+sig_genes_d = sig_genes_d %>%
+  left_join(
+    cbind(wilcox_result_sub[[1]], wilcox_result_sub[[2]], wilcox_result_sub[[3]]) %>% rownames_to_column("Gene")
+  )
+```
+
+```{r}
+matrisome_d = readxl::read_xlsx("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/matrisome_hs_masterlist.xlsx")
+
+sig_genes_d = sig_genes_d %>%
+  left_join(
+    matrisome_d %>% select(Gene = `Gene Symbol`, Category)
+  )
+```
+
+
+
+```{r}
+write_tsv(sig_genes_d, "/Volumes/TOSHIBA/TIMElab/figures/supplementary_data/signature_genes.tsv")
+```
+
+
+## Frequencies across histologies
+
+```{r}
+library(cowplot)
+library(tidyverse)
+
+barplot_pal = c("ECMhi" = "#E64B35FF", "ECMlo" = "#4DBBD5FF", "mixed" = "#e0e0e0")
+
+subtype_freq_by_histology = colData(se) %>%
+  as.data.frame() %>%
+  #filter(ECM.cluster != "mixed") %>%
+  group_by(Histology, ECM.cluster) %>%
+  summarise(Count = n()) %>%
+  ungroup() %>%
+  complete(Histology, ECM.cluster, fill = list(Count = 0)) %>%
+  group_by(Histology) %>%
+  mutate(Pct = Count/sum(Count), Total_samples = sum(Count)) %>%
+  filter(Total_samples > 1) %>%
+  drop_na()
+
+bmets_freq = read.table("/Volumes/TOSHIBA/TIMElab/GSE164150_RAW/Bmets_ECM_subtype_freq.tsv", sep="\t")
+subtype_freq_by_histology = rbind(subtype_freq_by_histology, bmets_freq)
+
+factor_levels = subtype_freq_by_histology %>%
+  filter(ECM.cluster == "ECMhi") %>%
+  arrange(desc(Pct)) %>%
+  pull(Histology)
+
+subtype_freq_by_histology$ECM.cluster = factor(subtype_freq_by_histology$ECM.cluster, levels = c("mixed", "ECMlo", "ECMhi"))
+subtype_freq_by_histology$Histology = factor(subtype_freq_by_histology$Histology, levels = factor_levels)
+#subtype_freq_by_histology = subtype_freq_by_histology %>% mutate(Count = ifelse(ECM.cluster == "mixed", "", Count))
+
+p = ggplot(subtype_freq_by_histology %>% filter(Count!=0), aes(fill=ECM.cluster, x=Histology, y = Pct)) + 
+    geom_bar(position="fill", stat="identity") +
+    geom_text(aes(label=Count), 
+            position=position_stack(vjust=0.5)) +
+  scale_fill_manual(values = barplot_pal) +
+  ylab("Frequency") +
+  xlab(NULL) +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  coord_flip()
+
+p
+```
+
+```{r, eval=F}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG1"
+ggsave(p, path=fig_path, filename= "ECM_subtype_freq_Histology.pdf", width=6, height=2.1, dpi = 700)
+```
+
+
+## Survival across histologies
+
+```{r}
+surv_data = colData(se) %>%
+  as.data.frame() %>%
+  filter(ECM.cluster != "mixed") %>%
+  drop_na(Deceased, ECM.cluster) %>%
+  mutate(Batch = substr(Batch, 1, 4))
+
+surv_data$Histology = factor(surv_data$Histology)
+surv_data$Batch = factor(surv_data$Batch)
+surv_data_list = group_split(surv_data, Batch) %>% as.list()
+names(surv_data_list) = levels(surv_data$Batch)
+
+batches_vec = names(surv_data_list)
+histologies_vec = levels(surv_data$Histology)
+
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG1/survival/ECM/"
+
+for (i in batches_vec) {
+    for (j in histologies_vec) {
+      surv_data_sub = surv_data_list[[i]] %>% filter(Histology == j)
+      if (length(unique(surv_data_sub$ECM.cluster))>1) {
+        p1 = ggsurvplot(survfit(Surv(OS, Deceased) ~ ECM.cluster,
+                            data=surv_data_sub,
+                            ), pval=T,
+                        surv.median.line = "v",
+                        pval.coord = c(1900, .98),
+                        legend = "none",
+                        font.x = 17,
+                        font.y = 17,
+                        font.title = 17,
+                        title = j,
+                        pval.size = 6,
+                        risk.table=F, risk.table.col="strata", palette = unname(palette_ECM_subtype), ylab = "OS", xlab = "Time (days)")
+    
+        pdf(paste0(fig_path, paste(j, i, "OS.pdf", sep="_")), width=4, height=3)
+        print(p1, newpage = FALSE)
+        dev.off()
+      }
+  }
+}
+
+```
+
+
+CAF
+```{r}
+surv_data = colData(se) %>%
+  as.data.frame() %>%
+  drop_na(Deceased, CAF_score_assignment)
+
+surv_data$Histology = factor(surv_data$Histology)
+surv_data$Batch = factor(surv_data$Batch)
+surv_data_list = group_split(surv_data, Batch) %>% as.list()
+names(surv_data_list) = levels(surv_data$Batch)
+
+batches_vec = names(surv_data_list)
+histologies_vec = levels(surv_data$Histology)
+
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG1/survival/"
+
+for (i in batches_vec) {
+    for (j in histologies_vec) {
+      surv_data_sub = surv_data_list[[i]] %>% filter(Histology == j)
+      if (length(unique(surv_data_sub$CAF_score_assignment))>1) {
+        p1 = ggsurvplot(survfit(Surv(OS, Deceased) ~ CAF_score_assignment,
+                            data=surv_data_sub
+                            ), pval=T, risk.table=F, risk.table.col="strata", palette = unname(palette_ECM_subtype), ylab = "OS", xlab = "Time (days)") + ggtitle(j)
+    
+        pdf(paste0(fig_path, paste(j, i, "OS.pdf", sep="_")), width=4, height=3)
+        print(p1, newpage = FALSE)
+        dev.off()
+      }
+  }
+}
+```
+
+
+```{r}
+pdf(paste0(fig_path, "surv_CGGA325.pdf"), width=3, height=3)
+print(p1, newpage = FALSE)
+dev.off()
+
+pdf(paste0(fig_path, "surv_CGGA693.pdf"), width=3, height=3)
+print(p2, newpage = FALSE)
+dev.off()
+
+pdf(paste0(fig_path, "surv_TCGA.pdf"), width=3, height=3)
+print(p3, newpage = FALSE)
+dev.off()
+```
+
+## Heatmap
+
+```{r}
+palette_ECM_subtype = c("ECMhi" = "#E64B35FF", "ECMlo" = "#4DBBD5FF")
+```
+
+
+```{r}
+bulk_COL_sigs = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+
+```
+
+
+#### Merged datasets
+
+```{r}
+sigs = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+```
+
+
+All ECM genes
+```{r}
+mat = t(scale(t(assay(se, 2)[matrisome_geneset,])))
+
+hcl = hclust(dist(mat))
+
+ht = Heatmap(
+  mat,
+  col = colorRamp2(seq(-2.5, 2.5, length.out=11), rev(brewer.pal(n=11, name="RdBu"))),
+  name = "Scaled expression",
+  column_split = factor(colData(se)$ECM.cluster, levels = c("ECMhi", "ECMlo")),
+  show_row_names = F,
+  show_row_dend = F,
+  row_split = 2,
+  show_column_names = F,
+  cluster_columns = T,
+  cluster_rows = hcl,
+  row_gap = unit(0, "mm"),
+  #column_gap = unit(0, "mm"),
+  border_gp = gpar(col = "black", lty = 1),
+  show_column_dend = F,
+  width = unit(6, "cm"), 
+  height = unit(10, "cm")
+)
+ht
+```
+
+```{r}
+pdf(paste0(fig_path, "matrisome_heatmap.pdf"), width = 5, height = 4)
+draw(ht)
+dev.off()
+```
+
+Signature genes
+
+```{r}
+sig_genes_d = sig_genes_d %>%
+  left_join(matrisome_d, by = c("Gene" = "Gene Symbol"))
+
+write_tsv(sig_genes_d, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures_anno.tsv")
+```
+
+```{r}
+mat = t(scale(t(assay(se, 2)[sig_genes_d$Gene,])))
+
+hcl = hclust(dist(mat))
+
+ha = HeatmapAnnotation(
+  "Subtype" = factor(colData(se)$ECM.cluster, levels = c("ECMhi", "ECMlo")),
+  col = list(
+    "Subtype" = palette_ECM_subtype),
+  show_legend = T,
+  show_annotation_name = F,
+  simple_anno_size = unit(.3, "cm")
+)
+
+ra = rowAnnotation(
+  "Category" = sig_genes_d$Category,
+  col = list(
+    "Category" = c("Collagens" = "#F54752",
+                   "ECM Glycoproteins" = "#F8DB91",
+                   "ECM Regulators" = "#5CBA8D",
+                   "ECM-affiliated Proteins" = "black")),
+  show_legend = T,
+  na_col = "white",
+  show_annotation_name = F,
+  simple_anno_size = unit(.25, "cm")
+)
+
+genes_to_label = c("LAMB1", "COL5A2", "LAMC1", "ITGA5", "MMP14", "COL1A1", "TGFBI", "FN1", "NFKB1", "BRSK2", "CNTN1", "CDK5R1", "PLXNB1", "COL3A1", "ADAM12", "POSTN", "RUNX1")
+genes_to_label = rownames(mat)[rownames(mat)%in%genes_to_label]
+
+ht = Heatmap(
+  mat,
+  col = colorRamp2(seq(-2.5, 2.5, length.out=11), rev(brewer.pal(n=11, name="RdBu"))),
+  name = "Scaled expression",
+  column_split = factor(colData(se)$ECM.cluster, levels = c("ECMhi", "ECMlo")),
+  row_split = sig_genes_d$Sig,
+  border_gp = gpar(col = "black", lty = 1),
+  show_row_names = T,
+  show_row_dend = F,
+  row_names_gp = gpar(fontsize = 3),
+  show_column_names = F,
+  #top_annotation = ha,
+  left_annotation = ra,
+  cluster_columns = T,
+  #cluster_rows = hcl,
+  show_column_dend = F,
+  width = unit(6, "cm"), 
+  height = unit(10, "cm"),
+  heatmap_legend_param = list(
+    legend_direction = "horizontal", 
+    legend_width = unit(3, "cm"))
+) +
+  rowAnnotation(link = anno_mark(at = which(rownames(mat) %in% genes_to_label), 
+                                 labels = genes_to_label, 
+                                 labels_gp = gpar(fontsize = 8), padding = unit(1.7, "mm")))
+
+draw(ht, heatmap_legend_side="bottom", annotation_legend_side="bottom",
+           legend_grouping = "original")
+```
+```{r}
+pdf(paste0(fig_path, "signature_genes_heatmap.pdf"), width = 6, height = 10)
+draw(ht, heatmap_legend_side="bottom", annotation_legend_side="bottom",
+           legend_grouping = "original")
+dev.off()
+```
+
+
+
+#### CGGA325
+
+```{r}
+se_sub = se[,colData(se)$Dataset=="CGGA325"]
+se_sub = se_sub[,!is.na(colData(se_sub)$ECM.cluster)]
+mat = t(scale(t(assay(se_sub, 1)[overlapping_ecm,])))
+
+hcl = hclust(dist(mat))
+
+ht_CGGA325 = Heatmap(
+  mat,
+  col = colorRamp2(seq(-3, 3, length.out=9), rev(brewer.pal(n=9, name="RdBu"))),
+  name = "Scaled expression",
+  column_split = factor(colData(se_sub)$ECM.cluster, levels = c("COL1lo", "COL1hi")),
+  show_row_names = F,
+  show_row_dend = F,
+  show_column_names = F,
+  cluster_columns = T,
+  cluster_rows = hcl,
+  show_column_dend = F,
+  width = unit(6, "cm"), 
+  height = unit(8, "cm")
+)
+ht_CGGA325
+```
+
+
+Signature genes
+```{r}
+se_sub = se[,colData(se)$Batch=="CGGA325"]
+se_sub = se_sub[,!is.na(colData(se_sub)$ECM.cluster)]
+mat = t(scale(t(assay(se_sub, 2)[sig_genes_d$Gene,])))
+
+hcl = hclust(dist(mat))
+
+ha = HeatmapAnnotation(
+  "Subtype" = factor(colData(se_sub)$ECM.cluster, levels = c("ECMlo", "ECMhi")),
+  col = list(
+    "Subtype" = palette_ECM_subtype),
+  show_legend = T,
+  show_annotation_name = F,
+  simple_anno_size = unit(.3, "cm")
+)
+
+ra = rowAnnotation(
+  "Subtype" = factor(sig_genes_d$Sig, levels = c("ECMlo", "ECMhi")),
+  col = list(
+    "Subtype" = palette_ECM_subtype),
+  show_legend = T,
+  show_annotation_name = F,
+  simple_anno_size = unit(.3, "cm")
+)
+
+ht_CGGA325 = Heatmap(
+  mat,
+  col = colorRamp2(seq(-3, 3, length.out=9), rev(brewer.pal(n=9, name="RdBu"))),
+  name = "Scaled expression",
+  column_split = factor(colData(se_sub)$ECM.cluster, levels = c("ECMlo", "ECMhi")),
+  row_split = 2,
+  border_gp = gpar(col = "black", lty = 1),
+  show_row_names = T,
+  show_row_dend = F,
+  row_names_gp = gpar(fontsize = 6),
+  show_column_names = F,
+  top_annotation = ha,
+  right_annotation = ra,
+  cluster_columns = T,
+  cluster_rows = hcl,
+  show_column_dend = F,
+  width = unit(6, "cm"), 
+  height = unit(8, "cm")
+)
+ht_CGGA325
+```
+
+
+```{r}
+pdf(paste0(fig_path, "CGGA325_ECM_heatmap.pdf"), width = 5, height = 4)
+draw(ht_CGGA325)
+dev.off()
+```
+
+
+#### TCGA
+
+```{r}
+se_sub = se[,colData(se)$Dataset=="TCGA"]
+se_sub = se_sub[,!is.na(colData(se_sub)$ECM.cluster)]
+mat = t(scale(t(assay(se_sub, 1)[overlapping_ecm,])))
+
+genes_to_label = rownames(mat)[rownames(mat)%in%col_hi_sig]
+
+
+
+
+ht_TCGA = Heatmap(
+  mat,
+  col = colorRamp2(seq(-3, 3, length.out=9), rev(brewer.pal(n=9, name="RdBu"))),
+  name = "Scaled expression",
+  column_split = factor(colData(se_sub)$ECM.cluster, levels = c("COL1hi", "COL1lo")),
+  show_row_names = F,
+  show_row_dend = F,
+  show_column_names = F,
+  cluster_columns = T,
+  cluster_rows = hcl,
+  show_column_dend = F,
+  width = unit(6, "cm"), 
+  height = unit(8, "cm")
+) 
+ht_TCGA
+```
+Signature genes
+```{r}
+se_sub = se[,colData(se)$Dataset=="TCGA"]
+se_sub = se_sub[,!is.na(colData(se_sub)$ECM.cluster)]
+mat = t(scale(t(assay(se_sub, 1)[sig_genes_d$Gene,])))
+
+ha = HeatmapAnnotation(
+  "Subtype" = factor(colData(se_sub)$ECM.cluster, levels = c("COL1lo", "COL1hi")),
+  col = list(
+    "Subtype" = palette_ECM_subtype),
+  show_legend = T,
+  show_annotation_name = F,
+  simple_anno_size = unit(.3, "cm")
+)
+
+ra = rowAnnotation(
+  "Subtype" = factor(sig_genes_d$Sig, levels = c("COL1lo", "COL1hi")),
+  col = list(
+    "Subtype" = palette_ECM_subtype),
+  show_legend = T,
+  show_annotation_name = F,
+  simple_anno_size = unit(.3, "cm")
+)
+
+ht_TCGA = Heatmap(
+  mat,
+  col = colorRamp2(seq(-3, 3, length.out=9), rev(brewer.pal(n=9, name="RdBu"))),
+  name = "Scaled expression",
+  column_split = factor(colData(se_sub)$ECM.cluster, levels = c("COL1lo", "COL1hi")),
+  row_split = 2,
+  border_gp = gpar(col = "black", lty = 1),
+  show_row_names = T,
+  show_row_dend = F,
+  row_names_gp = gpar(fontsize = 6),
+  show_column_names = F,
+  top_annotation = ha,
+  right_annotation = ra,
+  cluster_columns = T,
+  cluster_rows = hcl,
+  show_column_dend = F,
+  width = unit(6, "cm"), 
+  height = unit(8, "cm")
+)
+ht_TCGA
+```
+
+```{r}
+pdf(paste0(fig_path, "TCGA_ECM_heatmap.pdf"), width = 5, height = 4)
+draw(ht_TCGA)
+dev.off()
+```
+
+
+#### CGGA693
+
+```{r}
+se_sub = se[,colData(se)$Dataset=="CGGA693"]
+se_sub = se_sub[,!is.na(colData(se_sub)$ECM.cluster)]
+mat = t(scale(t(assay(se_sub, 1)[overlapping_ecm,])))
+
+genes_to_label = rownames(mat)[rownames(mat)%in%col_hi_sig]
+ht_CGGA693 = Heatmap(
+  mat,
+  col = colorRamp2(seq(-3, 3, length.out=9), rev(brewer.pal(n=9, name="RdBu"))),
+  name = "Scaled expression",
+  column_split = factor(colData(se_sub)$ECM.cluster, levels = c("COL1hi", "COL1lo")),
+  show_row_names = F,
+  show_row_dend = F,
+  show_column_names = F,
+  cluster_columns = T,
+  cluster_rows = hcl,
+  show_column_dend = F,
+  width = unit(6, "cm"), 
+  height = unit(8, "cm")
+) +
+  rowAnnotation(link = anno_mark(at = which(rownames(mat) %in% genes_to_label), 
+                                 labels = genes_to_label, 
+                                 labels_gp = gpar(fontsize = 10), padding = unit(1, "mm")))
+
+ht_CGGA693
+```
+Signature genes
+```{r}
+se_sub = se[,colData(se)$Dataset=="CGGA693"]
+se_sub = se_sub[,!is.na(colData(se_sub)$ECM.cluster)]
+mat = t(scale(t(assay(se_sub, 1)[sig_genes_d$Gene,])))
+
+ha = HeatmapAnnotation(
+  "Subtype" = factor(colData(se_sub)$ECM.cluster, levels = c("COL1lo", "COL1hi")),
+  col = list(
+    "Subtype" = palette_ECM_subtype),
+  show_legend = T,
+  show_annotation_name = F,
+  simple_anno_size = unit(.3, "cm")
+)
+
+ra = rowAnnotation(
+  "Subtype" = factor(sig_genes_d$Sig, levels = c("COL1lo", "COL1hi")),
+  col = list(
+    "Subtype" = palette_ECM_subtype),
+  show_legend = T,
+  show_annotation_name = F,
+  simple_anno_size = unit(.3, "cm")
+)
+
+ht_CGGA693 = Heatmap(
+  mat,
+  col = colorRamp2(seq(-3, 3, length.out=9), rev(brewer.pal(n=9, name="RdBu"))),
+  name = "Scaled expression",
+  column_split = factor(colData(se_sub)$ECM.cluster, levels = c("COL1lo", "COL1hi")),
+  row_split = 2,
+  border_gp = gpar(col = "black", lty = 1),
+  show_row_names = T,
+  show_row_dend = F,
+  row_names_gp = gpar(fontsize = 6),
+  show_column_names = F,
+  top_annotation = ha,
+  right_annotation = ra,
+  cluster_columns = T,
+  cluster_rows = hcl,
+  show_column_dend = F,
+  width = unit(6, "cm"), 
+  height = unit(8, "cm")
+)
+ht_CGGA693
+```
+
+```{r}
+pdf(paste0(fig_path, "CGGA693_ECM_heatmap.pdf"), width = 5, height = 4)
+draw(ht_CGGA693)
+dev.off()
+```
+
+```{r}
+ht_CGGA693 + ht_CGGA325 + ht_TCGA
+```
+
+
+## Plotting gene expression
+
+```{r}
+gene = "OPN"
+
+data.frame(logCPM = assay(se, 2)[gene,]) %>%
+  rownames_to_column("Sample") %>%
+  left_join(
+    colData(se) %>%
+      as.data.frame() %>%
+      rownames_to_column("Sample") %>%
+      select(Sample, ECM.cluster, FBlike.enrich, FBlike.sigscore)
+  )
+  
+```
+
+
+
+## Protein-level expression
+
+```{r}
+library(readxl)
+```
+
+```{r}
+mmc3 = read_xlsx("/Volumes/TOSHIBA/TIMElab/Sethi_Paper/mmc3.xlsx")
+
+gene_names_df = data.frame("Gene_id" = str_split(str_split(mmc3$Accession, "\\|", Inf, T)[,2], "_", Inf, T)[,1],
+                           "Description" = str_split(mmc3$Description, " OS", Inf, T)[,1])
+
+mmc10 = read_xlsx("/Volumes/TOSHIBA/TIMElab/Sethi_Paper/mmc10.xlsx", sheet="GBMvsControl_proteins")
+mmc10 = mmc10 %>%
+  #filter(FDR < 0.05, `Fold change (group1/group2)` > 0) %>%
+  left_join(gene_names_df, "Description")
+```
+
+```{r}
+ecm_sig = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+```
+
+```{r}
+rbind(
+  data.frame("Subtype" = "ECMhi", "Gene_id" = ecm_sig$ECMhi),
+  data.frame("Subtype" = "ECMlo", "Gene_id" = ecm_sig$ECMlo)
+) %>%
+  left_join(mmc10) %>%
+  drop_na()
+```
+
+## Deconvolution
+
+
+### Fges Bagaev
+
+```{r}
+fges_table = read_csv("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/Bagaev_Fges/Fges_table.csv")
+
+fges_list = list()
+for (i in unique(fges_table$`Gene signature`)) {
+  gene_list = fges_table[fges_table$`Gene signature`%in%c(i),]$Gene
+  gene_list = gene_list[gene_list%in%rownames(se)]
+  if (length(gene_list)>0) {
+    fges_list[[i]] = gene_list
+  }
+}
+```
+
+```{r}
+samples_oi = se$ECM.cluster!="mixed"
+
+sig_scores = scrabble::score(
+  mat = assay(se, 2)[,samples_oi],
+  groups = fges_list
+)
+```
+
+```{r}
+ht = Heatmap(t(sig_scores),
+        name = "Signature score",
+        column_split = factor(se$ECM.cluster[samples_oi], levels = c("ECMhi", "ECMlo")),
+        show_column_dend = F,
+        show_row_dend = F,
+        #column_title_rot = 90,
+        cluster_rows = T,
+        show_column_names = F,
+        show_row_names = T,
+        cluster_column_slices = F,
+        cluster_columns = T,
+        row_names_gp = gpar(fontsize = 7.5),
+        col = colorRamp2(seq(-3, 3, length.out=3), c("#3C5488FF", "grey", "#DC0000FF")),
+        width = unit(5, "cm"), 
+        height = unit(6, "cm"))
+
+ht
+```
+
+```{r}
+
+```
+
+
+ht1 taken from OpenPBTA analysis.Rmd
+```{r}
+ht1 + ht
+```
+```{r}
+fig_path = "/Volumes/TOSHIBA/TIMElab/figures/FIG1/"
+pdf(paste0(fig_path, "Badaev_Fges.pdf"), width = 10, height = 5)
+draw(ht1 + ht, legend_grouping = "original")
+dev.off()
+```
+
+### Generating data
+
+TIMER
+```{r, eval=F}
+library(immunedeconv)
+timer_result = immunedeconv::deconvolute(
+  2^(assay(se, 2)),
+  "timer",
+  indications = rep("gbm", ncol(se)))
+write_tsv(timer_result, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/deconv/TIMER.tsv")
+```
+
+xCell
+```{r, eval=F}
+xcell_result = immunedeconv::deconvolute(2^(assay(se, 2)), "xcell")
+write_tsv(xcell_result, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/deconv/XCELL.tsv")
+```
+
+
+### Analysis
+
+All data
+```{r}
+library(rstatix)
+library(ggpubr)
+library(cowplot)
+
+timer = read_tsv("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/deconv/TIMER.tsv")
+xcell_result = read_tsv("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/deconv/XCELL.tsv")
+palette_ECM_subtype = c("ECMhi" = "#E64B35FF", "ECMlo" = "#4DBBD5FF")
+```
+
+```{r}
+timer2 = timer %>%
+  column_to_rownames("cell_type") %>%
+  t() %>% as.data.frame() %>%
+  rownames_to_column("Sample") %>%
+  pivot_longer(!Sample, names_to = "Cell.type", values_to = "Frac")
+
+timer_plot = dplyr::select(colData(se) %>%
+                             as.data.frame() %>%
+                             rownames_to_column("Sample"), Sample, ECM.cluster, Batch) %>%
+  drop_na(ECM.cluster) %>%
+  left_join(timer2) %>%
+  drop_na(Frac)
+
+stat.test <- timer_plot %>%
+  group_by(Cell.type) %>%
+  t_test(Frac ~ ECM.cluster) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(y.position = y.position+.5)
+
+p = ggviolin(timer_plot,
+          x = "ECM.cluster",
+          y = "Frac",
+          add = c("boxplot", "jitter"),
+          color = "ECM.cluster",
+          palette = palette_ECM_subtype,
+          facet.by = "Cell.type",
+          outlier.shape = NA,
+          width = 0.6) +
+  #geom_dotplot(aes(fill = Cluster, color = Cluster), binaxis='y', stackdir='center', dotsize=.4) +
+  stat_pvalue_manual(stat.test, label = "p.adj.signif") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="Estimated cell fraction") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.3
+p
+```
+```{r, eval=F}
+ggsave(p, path=fig_path, filename= "TCGA_TIMER.pdf", width=7.5, height=4, dpi = 700)
+```
+
+Heatmap
+```{r}
+timer_mat = timer %>%
+  column_to_rownames("cell_type") %>%
+  as.matrix()
+
+stat.test = stat.test %>%
+  column_to_rownames("Cell.type")
+stat.test = stat.test[rownames(timer_mat),]
+
+ht = Heatmap(t(scale(t(timer_mat))),
+        column_split = colData(se)[colnames(timer_mat),]$ECM.cluster,
+        show_column_dend = F,
+        show_column_names = F,
+        show_row_dend = F,
+        row_names_gp = gpar(fontsize = 8),
+        left_annotation = rowAnnotation(pval = stat.test$p.adj.signif,
+                                        col = list(pval  = c("*" = "#FEE5D9",
+                                                             "**" = "#FCAE91",
+                                                             "***" = "#FB6A4A",
+                                                             "****" = "#CB181D",
+                                                             "ns" = "white")),
+                                        simple_anno_size = unit(.3, "cm")),
+        width = unit(10, "cm"), 
+        height = unit(1.538461536, "cm")
+      )
+```
+
+```{r}
+pdf(paste0(fig_path, "timer_heatmap.pdf"), width = 8, height = 8)
+draw(ht)
+dev.off()
+```
+
+XCELL
+```{r}
+xcell_result2 = xcell_result %>%
+  column_to_rownames("cell_type") %>%
+  t() %>% as.data.frame() %>%
+  rownames_to_column("Sample") %>%
+  pivot_longer(!Sample, names_to = "Cell.type", values_to = "Frac")
+
+xcell_plot = dplyr::select(colData(se) %>%
+                             as.data.frame() %>%
+                             rownames_to_column("Sample"), Sample, ECM.cluster, Batch) %>%
+  drop_na(ECM.cluster) %>%
+  left_join(xcell_result2) %>%
+  drop_na(Frac)
+
+stat.test <- xcell_plot %>%
+  group_by(Cell.type) %>%
+  t_test(Frac ~ ECM.cluster) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(y.position = y.position+.5)
+
+p = ggviolin(xcell_plot,
+          x = "ECM.cluster",
+          y = "Frac",
+          add = c("boxplot", "jitter"),
+          color = "ECM.cluster",
+          palette = palette_ECM_subtype,
+          facet.by = "Cell.type",
+          outlier.shape = NA,
+          width = 0.6) +
+  #geom_dotplot(aes(fill = Cluster, color = Cluster), binaxis='y', stackdir='center', dotsize=.4) +
+  stat_pvalue_manual(stat.test, label = "p.adj.signif") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.10))) +
+  theme_cowplot(15) +
+  labs(y="Estimated cell fraction") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.3
+p
+```
+
+```{r, eval=F}
+ggsave(p, path=fig_path, filename= "TCGA_XCELL.pdf", width=2.5*7, height=2*6, dpi = 700)
+```
+
+Heatmap
+```{r}
+xcell_mat = xcell_result %>%
+  column_to_rownames("cell_type") %>%
+  as.matrix()
+
+RColorBrewer::brewer.pal(4, "Reds")
+
+stat.test = stat.test %>%
+  column_to_rownames("Cell.type")
+stat.test = stat.test[rownames(xcell_mat),]
+
+ht = Heatmap(t(scale(t(xcell_mat))),
+        column_split = colData(se)[colnames(xcell_mat),]$ECM.cluster,
+        show_column_dend = F,
+        show_column_names = F,
+        show_row_dend = F,
+        row_names_gp = gpar(fontsize = 8),
+        left_annotation = rowAnnotation(pval = stat.test$p.adj.signif,
+                                        col = list(pval  = c("*" = "#FEE5D9",
+                                                             "**" = "#FCAE91",
+                                                             "***" = "#FB6A4A",
+                                                             "****" = "#CB181D",
+                                                             "ns" = "white")),
+                                        simple_anno_size = unit(.3, "cm")),
+        width = unit(10, "cm"), 
+        height = unit(10, "cm")
+      )
+```
+
+```{r}
+pdf(paste0(fig_path, "xcell_heatmap.pdf"), width = 8, height = 8)
+draw(ht)
+dev.off()
+```
+
+
+## FB-like score
+
+### Correlation
+
+```{r}
+se = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA-CGGA-SummarizedExperiment.rds")
+timer = read_tsv("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/deconv/TIMER.tsv")
+xcell_result = read_tsv("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/deconv/XCELL.tsv")
+```
+
+```{r}
+timer = timer %>%
+  column_to_rownames("cell_type") %>%
+  t()
+timer = timer[colnames(se),] %>%
+  as.data.frame()
+
+xcell_result = xcell_result %>%
+  column_to_rownames("cell_type") %>%
+  t()
+xcell_result = xcell_result[colnames(se),] %>%
+  as.data.frame()
+```
+
+```{r}
+timer$`FB score` <- colData(se)$FBlike.sigscore
+xcell_result$`FB score` <- colData(se)$FBlike.sigscore
+```
+
+
+```{r}
+library(corrplot)
+library(psych)
+
+corr.mtx = corr.test(timer, method="spearman")
+corr.mtx$r[corr.mtx$p>0.05] <- 0
+```
+
+```{r}
+pdf(paste0(fig_path, "FB_score_deconvolution.pdf"), width = 10, height = 4)
+corrplot(corr.mtx$r,type="upper",is.corr=T,  tl.col = "black")
+dev.off()
+```
+
+```{r}
+corr.mtx = corr.test(xcell_result, method="spearman")
+```
+
+```{r}
+pdf(paste0(fig_path, "FB_score_XCELL.pdf"), width = 15, height = 15)
+corrplot(corr.mtx$r,type="lower",is.corr=T, p.mat = corr.mtx$p, sig.level = 0.05, tl.col = "black")
+dev.off()
+```
+
+
+### Gene markers
+
+```{r}
+tcga = readRDS("H:/TIMElab/bulk_RNAseq/TCGA_GBM_DGEList.rds")
+```
+
+```{r}
+gene = "IFNAR1"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = 0, label.y = 2, label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_CD163.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+
+```{r}
+rownames(tcga)[grep("IFN", rownames(tcga))]
+```
+
+
+```{r}
+gene = "CD163"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = 0, label.y = 2, label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_CD163.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+```{r}
+gene = "ITGAM"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = 1, label.y = 3,  label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_ITGAM.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+
+```{r}
+gene = "CD3E"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman",label.x = 1, label.y = -2,  label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_CD3E.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+
+```{r}
+gene = "CD4"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = 1, label.y = 5,  label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_CD4.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+
+```{r}
+gene = "CD8A"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = 1, label.y = -1, label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_CD8A.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+```{r}
+gene = "LAG3"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = 1.5, label.y = -1.5,  label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_LAG3.pdf", width=2.5, height=2.5, dpi = 700)
+```
+```{r}
+gene = "TGFB1"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = 1, label.y = 5,   label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_TGFB1.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+```{r}
+gene = "CX3CR1"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = 1, label.y = 2.5,   label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_CX3CR1.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+
+```{r}
+gene = "PDCD1"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = .75, label.y = -4,  label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_PDCD1.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+```{r}
+gene = "TIGIT"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = .75, label.y = -4,  label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_TIGIT.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+
+```{r}
+gene = "LAG3"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = 1.5, label.y = -1,  label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_LAG3.pdf", width=2.5, height=2.5, dpi = 700)
+```
+```{r}
+gene = "TOX"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = .75, label.y = 1,  label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_TOX.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+```{r}
+gene = "CD274"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = .75, label.y = 0,  label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_CD274.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+```{r}
+gene = "IL2"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = .75, label.y = 0,  label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_IFNG.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+
+```{r}
+gene = "CD274"
+
+d = data.frame(Expression = assay(se, 2)[gene,])
+d$FB.score = se$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = 1, label.y = 1.5, label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+ggsave(p, path=fig_path, filename= "FB_score_CX3CR1.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+
+
+```{r}
+cgga693 = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/CGGA693_DGEList.rds")
+```
+
+```{r}
+gene = "TNF"
+
+d = data.frame(Expression = cgga693$log2cpm[gene,])
+d$FB.score = cgga693$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = .75, label.y = 0,  label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_CD274.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+
+```{r}
+gene = "SPP1"
+
+d = data.frame(Expression = tcga$log2cpm[gene,])
+d$FB.score = tcga$samples$FBlike.sigscore
+p = ggscatter(d, x = "FB.score", y = "Expression",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman",label.x = 1, label.y = -2,  label.sep = "\n")
+   ) + labs(x = "FB score", y = "logCPM")
+p
+ggsave(p, path=fig_path, filename= "FB_score_CD3E.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+
+## Stemness score
+
+```{r}
+stemness_geneset <- readLines("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/Stemness_Miranda/stemness_geneset.txt")
+```
+
+```{r}
+tcga  = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA_GBM_DGEList.rds")
+cgga693 = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/CGGA693_DGEList.rds")
+cgga325 = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/CGGA325_DGEList.rds")
+se = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA-CGGA-SummarizedExperiment.rds")
+```
+
+
+TCGA
+```{r, eval=F}
+tcga  = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA_GBM_DGEList.rds")
+tcga$log2cpm = log2(tcga$cpm+0.0001)
+
+sig_scores_tcga = scrabble::score(
+  mat = tcga$log2cpm,
+  groups = list("Stemness" = stemness_geneset[stemness_geneset%in%rownames(tcga)]),
+  replace = T
+)
+
+tcga$samples$stemness.sigscore <- NULL
+tcga$samples$stemness.sigscore <- sig_scores_tcga[,"Stemness"]
+
+saveRDS(tcga, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/TCGA_GBM_DGEList.rds")
+```
+
+
+CGGA 693
+```{r, eval=F}
+cgga693 = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/CGGA693_DGEList.rds")
+cgga693$log2cpm = log2(cgga693$cpm+0.0001)
+
+sig_scores_cgga693 = scrabble::score(
+  mat = cgga693$log2cpm,
+  groups = list("Stemness" = stemness_geneset[stemness_geneset%in%rownames(cgga693)]),
+  replace = T
+)
+
+cgga693$samples$stemness.sigscore <- NULL
+cgga693$samples$stemness.sigscore <- sig_scores_cgga693[,"Stemness"]
+
+saveRDS(cgga693, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/CGGA693_DGEList.rds")
+```
+
+
+CGGA 325
+```{r, eval=F}
+cgga325 = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/CGGA325_DGEList.rds")
+cgga325$log2cpm = log2(cgga325$cpm+0.0001)
+
+sig_scores_cgga325 = scrabble::score(
+  mat = cgga325$log2cpm,
+  groups = list("Stemness" = stemness_geneset[stemness_geneset%in%rownames(cgga325)]),
+  replace = T
+)
+
+cgga325$samples$stemness.sigscore <- NULL
+cgga325$samples$stemness.sigscore <- sig_scores_cgga325[,"Stemness"]
+
+saveRDS(cgga325, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/CGGA325_DGEList.rds")
+```
+
+
+### Correlation
+
+TCGA
+```{r}
+d = tcga$samples
+
+p = ggscatter(d, x = "FBlike.sigscore", y = "stemness.sigscore",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.sep = "\n")
+   ) + labs(x = "FB score", y = "Stemness score")
+p
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures/FIG4/", filename= "FB_score_stemness_TCGA.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+```{r}
+library(rstatix)
+
+d = tcga$samples
+d = d %>%
+  rownames_to_column() %>%
+  left_join(colData(se) %>% as.data.frame() %>% rownames_to_column() %>% select(rowname, ECM.cluster)) %>%
+  filter(!is.na(ECM.cluster))
+d$ECM.cluster = factor(d$ECM.cluster, levels=c("ECMlo", "ECMhi"))
+
+stat.test <- d %>%
+  t_test(stemness.sigscore ~ ECM.cluster) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(y.position = y.position+.5)
+
+stat.test_tcga = stat.test %>% mutate(Dataset = "TCGA")
+
+p = ggviolin(
+  d,
+  x = "ECM.cluster",
+  add = c("jitter", "boxplot"),
+  color = "ECM.cluster",
+  y = "stemness.sigscore") +
+  xlab(NULL) +
+  ylab("Stemness score") +
+  ylim(-1, 1.75) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_color_manual(values = palette_ECM_subtype)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.5
+
+p = p + cowplot::theme_cowplot() + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+p
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures/FIG4/", filename= "ECM.cluster_stemness_TCGA.pdf", width=3, height=2.75, dpi = 700)
+```
+
+
+
+CGGA325
+```{r}
+d = cgga325$samples
+p = ggscatter(d, x = "FBlike.sigscore", y = "stemness.sigscore",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = 1, label.y = -.5, label.sep = "\n")
+   ) + labs(x = "FB score", y = "Stemness score")
+p
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures/FIG4/", filename= "FB_score_stemness_CGGA325.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+```{r}
+library(rstatix)
+
+d = cgga325$samples
+d = d %>%
+  rownames_to_column() %>%
+  left_join(colData(se) %>% as.data.frame() %>% rownames_to_column() %>% select(rowname, ECM.cluster)) %>%
+  filter(!is.na(ECM.cluster))
+d$ECM.cluster = factor(d$ECM.cluster, levels=c("ECMlo", "ECMhi"))
+
+stat.test <- d %>%
+  t_test(stemness.sigscore ~ ECM.cluster) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(y.position = y.position+.5)
+
+stat.test_cgga325 = stat.test %>% mutate(Dataset = "CGGA325")
+
+p = ggviolin(
+  d,
+  x = "ECM.cluster",
+  add = c("jitter", "boxplot"),
+  color = "ECM.cluster",
+  y = "stemness.sigscore") +
+  xlab(NULL) +
+  ylab("Stemness score") +
+  ylim(-1, 1.75) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_color_manual(values = palette_ECM_subtype)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.5
+
+p = p + cowplot::theme_cowplot() + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+p
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures/FIG4/", filename= "ECM.cluster_stemness_CGGA325.pdf", width=3, height=2.75, dpi = 700)
+```
+
+
+CGGA693
+```{r}
+d = cgga693$samples
+p = ggscatter(d, x = "FBlike.sigscore", y = "stemness.sigscore",
+   color = "black",  size = .1, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#3C5488FF", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "spearman", label.x = 1, label.y = 1.2, label.sep = "\n")
+   ) + labs(x = "FB score", y = "Stemness score")
+p
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures/FIG4/", filename= "FB_score_stemness_CGGA693.pdf", width=2.5, height=2.5, dpi = 700)
+```
+
+
+```{r}
+library(rstatix)
+
+d = cgga693$samples
+d = d %>%
+  rownames_to_column() %>%
+  left_join(colData(se) %>% as.data.frame() %>% rownames_to_column() %>% select(rowname, ECM.cluster)) %>%
+  filter(!is.na(ECM.cluster))
+d$ECM.cluster = factor(d$ECM.cluster, levels=c("ECMlo", "ECMhi"))
+
+stat.test <- d %>%
+  t_test(stemness.sigscore ~ ECM.cluster) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "ECM.cluster") %>%
+  mutate(y.position = y.position+.5)
+
+stat.test_cgga693 = stat.test %>% mutate(Dataset = "CGGA693")
+
+p = ggviolin(
+  d,
+  x = "ECM.cluster",
+  add = c("jitter", "boxplot"),
+  color = "ECM.cluster",
+  y = "stemness.sigscore") +
+  xlab(NULL) +
+  ylab("Stemness score") +
+  ylim(-1, 1.75) +
+  stat_pvalue_manual(stat.test, label = "p.adj") +
+  scale_color_manual(values = palette_ECM_subtype)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.5
+
+p = p + cowplot::theme_cowplot() + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+p
+ggsave(p, path="/Volumes/TOSHIBA/TIMElab/figures/FIG4/", filename= "ECM.cluster_stemness_CGGA693.pdf", width=3, height=2.75, dpi = 700)
+```
+
+
+```{r}
+stat.test = rbind(
+  stat.test_cgga325,
+  stat.test_cgga693,
+  stat.test_tcga
+  )
+
+stat.test$p.adj = p.adjust(stat.test$p, method = "holm")
+
+stat.test = stat.test %>%
+  select(-.y.)
+```
+
+```{r}
+write_tsv(stat.test, "/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/Stemness_Wang/stemness_scores_stats.tsv")
+```
+
+
+## Ivy Gap
+
+Reading data
+```{r}
+fpkm_table = read_csv("/Volumes/TOSHIBA/TIMElab/ivy_gap/gene_expression_matrix_2014-11-25/fpkm_table.csv")
+colnames(fpkm_table)[1] = "gene_id"
+rows_genes = read_csv("/Volumes/TOSHIBA/TIMElab/ivy_gap/gene_expression_matrix_2014-11-25/rows-genes.csv")
+samples = read_tsv("/Volumes/TOSHIBA/TIMElab/ivy_gap/processed/columns-samples.tsv")
+```
+
+```{r}
+fpkm_table$gene_symbol = rows_genes$gene_symbol
+fpkm_table$gene_id = NULL
+fpkm_table = fpkm_table %>% relocate(gene_symbol, 1) %>% column_to_rownames("gene_symbol")
+fpkm_table = log2(fpkm_table+0.001)
+```
+
+Reading sigatures
+```{r}
+sigs = readRDS("/Volumes/TOSHIBA/TIMElab/bulk_RNAseq/ECM_gene_signatures.rds")
+```
+
+```{r}
+col_ivygap = c("#39829A", "#8E28C9", "#5EC7F6", "#EF6619", "#ED4119", "#46C509", "#49C69F")
+names(col_ivygap) = c("LE", "IT", "CTpnz", "CThbv", "CTmvp", "CT", "CTpan")
+```
+
+
+Heatmap of signature scores
+```{r}
+library(scrabble)
+
+sigs$ECMhi = sigs$ECMhi[sigs$ECMhi%in%rownames(fpkm_table)]
+sigs$ECMlo = sigs$ECMlo[sigs$ECMlo%in%rownames(fpkm_table)]
+
+sig_scores = scrabble::score(
+  mat = fpkm_table,
+  groups = sigs
+)
+
+ha = HeatmapAnnotation(
+  "Region" = factor(samples$structure, levels = c("LE", "IT", "CT", "CThbv", "CTmvp", "CTpan", "CTpnz")),
+  col = list(
+    "Region" = col_ivygap),
+  show_legend = T,
+  show_annotation_name = F,
+  simple_anno_size = unit(.3, "cm")
+)
+
+ht1 = Heatmap(t(sig_scores),
+        name = "Signature score",
+        top_annotation = ha,
+        column_split = factor(samples$structure, levels = c("LE", "IT", "CT", "CThbv", "CTmvp", "CTpan", "CTpnz")),
+        show_column_dend = F,
+        show_row_dend = F,
+        column_title_rot = 90,
+        show_column_names = F,
+        col = colorRamp2(seq(-3, 3, length.out=11), rev(brewer.pal(n=11, name="RdBu"))),
+        width = unit(11, "cm"), 
+        height = unit(1, "cm"))
+
+ht1
+```
+
+```{r}
+pdf(paste0(fig_path, "ivy_gap_scores.pdf"), width = 10, height = 4)
+draw(ht)
+dev.off()
+```
+
+
+```{r}
+fpkm_table_scaled = t(scale(t(fpkm_table)))
+mat = fpkm_table_scaled[rownames(fpkm_table_scaled)%in%c(sigs$ECMhi, sigs$ECMlo),]
+
+ha = HeatmapAnnotation(
+  "Region" = factor(samples$structure, levels = c("LE", "IT", "CT", "CThbv", "CTmvp", "CTpan", "CTpnz")),
+  col = list(
+    "Region" = col_ivygap),
+  show_legend = T,
+  show_annotation_name = F,
+  simple_anno_size = unit(.3, "cm")
+)
+
+row_split_vec = c()
+row_split_vec[rownames(mat)%in%sigs$ECMhi] = "ECMhi"
+row_split_vec[rownames(mat)%in%sigs$ECMlo] = "ECMlo"
+
+ht = Heatmap(
+  mat,
+  name = "Scaled expr",
+  col = colorRamp2(seq(-3, 3, length.out=11), rev(brewer.pal(n=11, name="RdBu"))),
+  row_split = factor(row_split_vec),
+  show_row_names = F,
+  show_row_dend = F,
+  column_title_rot = 90,
+  row_names_gp = gpar(fontsize = 3),
+  show_column_names = F,
+  top_annotation = ha,
+  show_column_dend = F,
+  cluster_columns = TRUE,
+  width = unit(11, "cm"), 
+  height = unit(7, "cm"),
+  cluster_column_slices = TRUE,
+  column_split = factor(samples$structure, levels = c("LE", "IT", "CT", "CThbv", "CTmvp", "CTpan", "CTpnz"))
+)
+
+ht
+```
+
+```{r}
+pdf("/Volumes/TOSHIBA/TIMElab/figures/FIG1/Supplement/ivygap_heatmap.pdf", width = 8, height = 5)
+draw(ht)
+dev.off()
+```
+
+
+
+```{r}
+pdf("/Volumes/TOSHIBA/TIMElab/figures/FIG1/Supplement/ivygap_heatmap_sig_score.pdf", width = 8, height = 5)
+draw(ht %v% ht1)
+dev.off()
+```
+
+
+
+### Deriving gene signatures
+
+```{r, eval=F}
+wilcox_genomewide = function(count_norm, conditions) {
+  pvalues <- sapply(1:nrow(count_norm), function(i){
+  data <- cbind.data.frame(gene = as.numeric(t(count_norm[i,])), conditions)
+  p <- wilcox.test(gene~conditions, data)$p.value
+  return(p)
+  })
+  fdr <- p.adjust(pvalues, method = "fdr")
+  hist(pvalues)
+  
+  conditionsLevel <- levels(conditions)
+  dataCon1 <- count_norm[,c(which(conditions==conditionsLevel[2]))]
+  dataCon2 <- count_norm[,c(which(conditions==conditionsLevel[1]))]
+  FC <- rowMeans(dataCon2)/rowMeans(dataCon1)
+  
+  
+  outRst <- data.frame(FC = FC, p.value = pvalues, FDR = fdr) %>%
+    mutate(Log2FC = log2(abs(FC)),
+           Log2FC = ifelse(FC < 0, Log2FC*-1, Log2FC))
+  rownames(outRst) <- rownames(count_norm)
+  outRst <- na.omit(outRst)
+  outRst = outRst %>% arrange(FDR)
+  
+  return(outRst)
+}
+```
+
+```{r}
+wilcox_genomewide
+```
+
+
+
+
+
+
+
+
+Correlation in RNA data
+
+```{r}
+cor_mat = cor(t(fpkm_table), method="spearman")
+col_cor = cor_mat["COL1A1",]
+saveRDS(col_cor, "/Volumes/TOSHIBA/TIMElab/ivy_gap/COL1A1_cor.rds")
+```
+
+```{r}
+col_cor = readRDS("/Volumes/TOSHIBA/TIMElab/ivy_gap/COL1A1_cor.rds")
+col_cor = col_cor[col_cor>.7]
+col_cor = col_cor[!is.na(col_cor)]
+sort(col_cor)
+cat(names(col_cor), sep="/n")
+```
+
+
+PXDN: In turns, directly contributes to the collagen IV network-dependent fibronectin/FN and laminin assembly, which is required for full extracellular matrix (ECM)-mediated signaling (PubMed:32543734, 34679700, 19590037).
+CD93: The protein encoded by this gene is a cell-surface glycoprotein and type I membrane protein that was originally identified as a myeloid cell-specific marker
+HSPG2: Perlecan is a key component of the vascular extracellular matrix, where it helps to maintain the endothelial barrier function. It is a potent inhibitor of smooth muscle cell proliferation and is thus thought to help maintain vascular homeostasis.
+ITGA5
+IL4R?
+ACTA2 - SMAa
+
+COL1A1, COL4A1, PXDN
+
+
+
+Plot expression
+
+```{r}
+fpkm_table_long = as.data.frame(t(fpkm_table))
+fpkm_table_long$ECMhi = sig_scores[,1]
+fpkm_table_long$ECMlo = sig_scores[,2]
+
+fpkm_table_long = fpkm_table_long %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("Gene") %>%
+  pivot_longer(!Gene, names_to = "Sample", values_to = "Expression") %>%
+  mutate(Sample = as.numeric(Sample)) %>%
+  left_join(samples, by = c("Sample"="rna_well_id"))
+```
+
+```{r}
+genes = c("ECMhi","PDGFRB", "COL4A1", "PECAM1", "ACTA2", "TEK")
+
+fpkm_table_long_sub = filter(fpkm_table_long, Gene %in% genes)
+#fpkm_table_long_sub$Expression = log10(fpkm_table_long_sub$Expression)
+fpkm_table_long_sub$Gene = factor(fpkm_table_long_sub$Gene, levels= genes)
+
+p = ggviolin(
+  fpkm_table_long_sub,
+  x = "structure",
+  add = c("jitter", "boxplot"),
+  color = "structure",
+  y = "Expression") +
+  xlab(NULL) +
+  ylab(bquote(log[10](FPKM))) +
+  scale_color_manual(values = col_ivygap)
+idx <- which(sapply(p$layers, function(l) "PositionJitter" %in% class(l$position)))
+p$layers[[idx]]$aes_params$size <- .1
+p$layers[[idx]]$aes_params$alpha <- 0.5
+
+pp = facet(p, facet.by = "Gene", ncol=2)
+pp = pp + cowplot::theme_cowplot() + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+pp
+```
+```{r}
+ggsave(pp, path=fig_path, filename= "ivygap_violin.pdf", width=6, height=5, dpi = 700)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Correlation in ISH data (not finished, takes time to run)
+
+```{r}
+ish_data = read.table("/Users/plezar/Downloads/gene_expression_details.csv", sep=",", header=T)
+
+sign_d = rbind(
+  data.frame(Gene = col_hi_sig, Signature = "COL1hi"),
+  data.frame(Gene = col_lo_sig, Signature = "COL1lo")
+)
+
+ish_data_plot = sign_d %>%
+  left_join(
+    ish_data, by = c("Gene" = "gene_symbol")
+  ) %>%
+  drop_na(sub_block_name) %>%
+  pivot_longer(starts_with("expression"), names_to = "region", values_to = "expression") %>%
+  drop_na(expression)
+ish_data_plot$region = str_split(ish_data_plot$region, "_", Inf, T)[,3]
+
+
+ggboxplot(
+  ish_data_plot %>% filter(Gene == "COL1A1"),
+  x = "region",
+  add = "jitter",
+  y = "expression",
+  color = "region"
+)
+
+```
+
+```{r}
+ish_data_mtx = ish_data %>%
+  pivot_longer(starts_with("expression"), names_to = "region", values_to = "expression") %>%
+  mutate(region = str_split(region, "_", Inf, T)[,3]) %>%
+  select(sub_block_name, gene_symbol, region, expression) %>%
+  unite("sample", c(sub_block_name, region)) %>%
+  drop_na() %>%
+  distinct(sample, gene_symbol, .keep_all = T) %>%
+  pivot_wider(names_from = "sample", values_from = "expression") %>%
+  column_to_rownames("gene_symbol")
+
+y = as.numeric(ish_data_mtx["COL1A1",])
+cor_vec = c()
+for (i in 1:nrow(ish_data_mtx)) {
+  x = as.numeric(ish_data_mtx[i,])
+  bool = !is.na(x) & !is.na(y)
+  cor_vec <- c(cor_vec, cor(x[bool], y[bool], method = "spearman"))
+  print(i)
+}
+names(cor_vec) = rownames(ish_data_mtx)
+```
+
+```{r}
+cor_vec = cor_vec[cor_vec>.7]
+cor_vec = cor_vec[!is.na(cor_vec)]
+sort(cor_vec)
+```
